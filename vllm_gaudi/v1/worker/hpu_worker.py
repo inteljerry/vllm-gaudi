@@ -491,7 +491,7 @@ class HPUWorker(WorkerBase):
                     mamba_state_per_block, ratio)
                 available = adjusted
 
-        return available
+        return int(available)
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks

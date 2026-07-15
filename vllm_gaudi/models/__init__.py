@@ -1,7 +1,7 @@
 from vllm.model_executor.models.registry import ModelRegistry
 
 
-def register_model():
+def _register_model_stock():
     from vllm_gaudi.models.gemma3_mm import HpuGemma3ForConditionalGeneration  # noqa: F401
     ModelRegistry.register_model(
         "Gemma3ForConditionalGeneration",  # Original architecture identifier in vLLM
@@ -56,3 +56,34 @@ def register_model():
     import vllm_gaudi.models.gptoss_mxfp4  # noqa: F401
     import vllm_gaudi.models.qwen3_next  # noqa: F401
     import vllm_gaudi.models.qwen3_5  # noqa: F401
+
+
+def register_model():
+    # MiniMax-M3, registered by LAZY STRING (module imported only when a
+    # request actually uses the arch), so registration never eagerly pulls
+    # torchvision.
+    #   * MiniMaxM3SparseForConditionalGeneration (the checkpoint's own
+    #     arch) -> the VL model (vision tower + text backbone). Its native,
+    #     torchvision-free image processor makes image requests work; a
+    #     text-only request through it simply skips the vision path.
+    #   * MiniMaxM3SparseForCausalLM -> the lean text-only class (use via
+    #     --hf-overrides architectures for a text-only serve with no vision
+    #     tower in memory, e.g. the max-KV long-context profile).
+    from vllm.model_executor.models.registry import ModelRegistry
+    ModelRegistry.register_model(
+        "MiniMaxM3SparseForConditionalGeneration",
+        "vllm_gaudi.models.minimax_m3_vl:MiniMaxM3SparseForConditionalGeneration")
+    ModelRegistry.register_model(
+        "MiniMaxM3SparseForCausalLM",
+        "vllm_gaudi.models.minimax_m3:HpuMiniMaxM3SparseForCausalLM")
+    # Override the stock eagle3 llama draft with the fc_norm-capable
+    # variant (newer draft checkpoints, e.g. Inferact/MiniMax-M3-EAGLE3,
+    # carry per-aux fc_norm.{0,1,2} weights the pinned class cannot load).
+    ModelRegistry.register_model(
+        "LlamaForCausalLMEagle3",
+        "vllm_gaudi.models.llama_eagle3_fcnorm:Eagle3LlamaForCausalLMFcNorm")
+    try:
+        _register_model_stock()
+    except Exception as e:  # optional (e.g. VL) models may need torchvision
+        import logging
+        logging.getLogger(__name__).warning("some plugin models skipped: %s", e)

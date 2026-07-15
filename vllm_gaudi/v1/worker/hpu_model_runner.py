@@ -616,9 +616,12 @@ def apply_model_specific_patches(model_runner):
     maybe_set_chunked_attention_layers(model_runner)
     patch_llama4_get_attn_scale(model_runner.model)
     _init_mamba_split_weights(model_runner.model)
-    from vllm_gaudi.models.llama4 import (apply_hpu_llama4_post_load_patches, is_hpu_llama4_model)
-    model_runner._has_heterogeneous_layers = is_hpu_llama4_model(model_runner.model)
-    apply_hpu_llama4_post_load_patches(model_runner.model)
+    try:
+        from vllm_gaudi.models.llama4 import (apply_hpu_llama4_post_load_patches, is_hpu_llama4_model)
+        model_runner._has_heterogeneous_layers = is_hpu_llama4_model(model_runner.model)
+        apply_hpu_llama4_post_load_patches(model_runner.model)
+    except ImportError:  # llama4 support needs torchvision (absent for text-only M3)
+        model_runner._has_heterogeneous_layers = False
 
 
 def compute_prefix_caching_block_indices(num_reqs: int, num_computed_tokens, num_scheduled_tokens,
@@ -835,7 +838,7 @@ def _mark_unbacked_dim0(tensor: torch.Tensor):
 
 def _maybe_wrap_in_hpu_graph(*args, **kwargs):
     return htorch.hpu.wrap_in_hpu_graph(HpuModelAdapter(
-        *args, **kwargs), disable_tensor_cache=True) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
+        *args, **kwargs), disable_tensor_cache=True, free_inplace=False) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
             *args, **kwargs)
 
 
@@ -4395,7 +4398,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         ################## Spec Decode ##################
         # Now, we will call drafter to propose draft token ids
-        if self.speculative_config:
+        # Intermediate chunked-prefill steps perform no sampling: sampling_metadata
+        # is unbound there and there is nothing to draft from -- skip proposing and
+        # clear any drafts left over from the previous step.
+        if self.speculative_config and "sampling_metadata" not in locals():
+            self._draft_token_ids = None
+        elif self.speculative_config:
             self._draft_token_ids = self.propose_draft_token_ids(
                 scheduler_output, postprocessed_sampled_token_ids, sampling_metadata, non_flattened_hidden_states,
                 sample_hidden_states, aux_hidden_states, prefill_sampled_token_ids_device,
@@ -6213,9 +6221,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             kv_cache_spec = group.kv_cache_spec
                             break
                     assert kv_cache_spec is not None, f"No spec found for {layer_name}"
+                    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs as _UTKVS
+                    if isinstance(kv_cache_spec, _UTKVS) and layer_name in kv_cache_spec.kv_cache_specs:
+                        # merged multi-layer spec: divisibility/shape math needs THIS layer's spec
+                        kv_cache_spec = kv_cache_spec.kv_cache_specs[layer_name]
                     assert kv_cache_tensor.size % kv_cache_spec.page_size_bytes == 0
                     num_blocks = \
-                        kv_cache_tensor.size // kv_cache_spec.page_size_bytes
+                        int(kv_cache_tensor.size) // kv_cache_spec.page_size_bytes
                     # `num_blocks` is the number of blocks the model runner can use.
                     # `kv_cache_config.num_blocks` is the number of blocks that
                     # KVCacheManager may allocate.
