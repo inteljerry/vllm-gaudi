@@ -47,6 +47,18 @@ Currently:
   on small/low-batch models.  We restore a single-pass free for the
   ``enable_caching=False`` case and delegate to the original implementation
   when prefix caching is on.  Remove once fixed upstream.
+
+* ``vllm.model_executor.layers.mla.MLAModules.is_sparse`` — DeepSeek Sparse
+  Attention (DSA) models (``glm_moe_dsa`` / GLM-5.2, DeepSeek-V3.2) build their
+  MLA modules with ``is_sparse=True``, which makes the model call the DSA
+  "lightning indexer" forward.  HPU has no DSA / sparse-MLA kernel, and the
+  indexer forward crashes on HPU (a ``160`` vs ``[64, 64]`` key-split mismatch
+  for GLM's interleaved-rope indexer).  We force ``is_sparse=False`` on every
+  ``MLAModules`` so the model runs DENSE MLA — the indexer submodule is still
+  built but never called.  Dense MLA equals the trained DSA path exactly for
+  ``seq_len <= index_topk`` and degrades gracefully at longer context.
+  Complements the ``platform.py`` backend fallback (dense MLA instead of
+  raising on ``use_sparse``).
 """
 
 import gc
@@ -332,6 +344,39 @@ def _patch_free_blocks() -> None:
     BlockPool.free_blocks = _hpu_free_blocks
 
 
+def _patch_mla_dense_bypass() -> None:
+    """Force dense MLA on HPU by disabling the DSA indexer (rationale in module docstring).
+
+    Wraps ``MLAModules.__init__`` to set ``is_sparse=False`` so DSA models
+    (``glm_moe_dsa`` / GLM-5.2, DeepSeek-V3.2) run dense MLA instead of the
+    HPU-unsupported sparse indexer.  Deferred to ``load_general_plugins`` time so
+    ``vllm.model_executor.layers.mla`` imports cleanly and the override is in
+    place before any ``MLAModules`` is built.  No-op if the ``is_sparse`` field
+    goes away (e.g. a real HPU DSA backend lands).
+    """
+    import dataclasses
+
+    import vllm.model_executor.layers.mla as _mla_mod
+
+    cls = getattr(_mla_mod, "MLAModules", None)
+    if cls is None or not dataclasses.is_dataclass(cls):
+        return  # module shape changed
+    if not any(f.name == "is_sparse" for f in dataclasses.fields(cls)):
+        return  # no is_sparse field — nothing to bypass
+    if getattr(cls.__init__, "_vllm_gaudi_dense_bypass", False):
+        return  # already patched
+
+    _orig_init = cls.__init__
+
+    def _init(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        # object.__setattr__ works whether or not MLAModules is a frozen dataclass.
+        object.__setattr__(self, "is_sparse", False)
+
+    _init._vllm_gaudi_dense_bypass = True  # type: ignore[attr-defined]
+    cls.__init__ = _init
+
+
 def apply() -> None:
     """Install all HPU runtime monkey-patches."""
     # --- torch.accelerator.empty_cache ---
@@ -363,6 +408,7 @@ def apply() -> None:
         _patch_batched_count_greater_than()
         _patch_gather_logprobs()
         _patch_free_blocks()
+        _patch_mla_dense_bypass()
 
     _plugins_mod.load_general_plugins = _load_general_with_hpu_patches
 

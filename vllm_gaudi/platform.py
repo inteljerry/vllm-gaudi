@@ -75,7 +75,12 @@ class HpuPlatform(Platform):
             return AttentionBackendEnum.CPU_ATTN.get_path()
 
         if attn_selector_config.use_sparse:
-            raise NotImplementedError("Sparse Attention is not supported on HPU.")
+            # DSA indexer has no HPU kernel; for use_mla models (glm_moe_dsa /
+            # GLM-5.2) fall back to dense MLA instead of failing (see patches.py).
+            if attn_selector_config.use_mla:
+                logger.warning("Sparse Attention (DSA) not implemented on HPU; using DENSE MLA fallback.")
+            else:
+                raise NotImplementedError("Sparse Attention is not supported on HPU.")
 
         if attn_selector_config.use_mla:
             logger.info("Using HPUAttentionMLA backend.")
