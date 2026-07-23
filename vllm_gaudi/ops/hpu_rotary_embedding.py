@@ -11,10 +11,22 @@ from vllm.model_executor.layers.rotary_embedding import (RotaryEmbedding, Phi3Lo
 from vllm.model_executor.custom_op import CustomOp
 
 
-def _fp32_rope_enabled() -> bool:
-    # Only the base HPURotaryEmbedding.forward_oot honors this; scaled-rope subclasses do not.
-    v = os.environ.get('VLLM_FP32_ROPE')
-    return v is not None and v.lower() in ('1', 'true', 't', 'yes', 'y', 'on')
+def _fp32_rope_mode() -> str:
+    """VLLM_FP32_ROPE (base HPURotaryEmbedding only; scaled-rope subclasses ignore it):
+      '1'/'true'/'on'/'fused' -> 'fused': fp32 cos/sin fed to the fused Habana apply_rotary_pos_emb
+                                 (one kernel; the kernel honors fp32 -- hardware-verified byte-exact);
+      'manual'                -> manual fp32 rotate_half (CPU bit-exact vs vLLM canonical; same
+                                 fidelity and perf as fused, kept as a verifiable fallback);
+      else / unset            -> off (fused bf16 kernel).
+    fp32 RoPE fixes byte-exact long-context copy (bf16 RoPE phase-noise cliffs ~196.6K). It costs
+    ~20% decode tok/s at SHORT ctx but only ~3% at 128K-256K (decode is KV-bound there), so it is
+    opt-in -- enable for long-context byte-exact-transcription workloads."""
+    v = (os.environ.get('VLLM_FP32_ROPE') or '').lower()
+    if v in ('1', 'true', 't', 'yes', 'y', 'on', 'fused'):
+        return 'fused'
+    if v == 'manual':
+        return 'manual'
+    return 'off'
 
 
 def _apply_rope_fp32(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, is_neox: bool) -> torch.Tensor:
@@ -90,13 +102,31 @@ class HPURotaryEmbedding(RotaryEmbedding):
 
         # fp32 RoPE (VLLM_FP32_ROPE): rotate from a true-fp32 cos/sin cache to avoid the bf16
         # phase-noise floor at large positions; math matches the kernel path below.
-        if _fp32_rope_enabled():
-            num_tokens = positions.numel()
+        num_tokens = positions.numel()
+        fp32_mode = _fp32_rope_mode()
+        if fp32_mode != 'off':
             cos, sin = self._fp32_cos_sin(positions, offsets)
             query_shape = query.shape
             key_shape = key.shape
             query = query.view(num_tokens, -1, self.head_size)
             key = key.view(num_tokens, -1, self.head_size)
+            if fp32_mode == 'fused':
+                # 'fused': feed fp32 cos/sin + fp32 q/k to the ONE fused Habana kernel instead of
+                # the ~14 unfused manual ops, recovering kernel speed if the kernel honors fp32.
+                rope_mode = (RotaryPosEmbeddingMode.BLOCKWISE
+                             if self.is_neox_style else RotaryPosEmbeddingMode.PAIRWISE)
+                if self.head_size == self.rotary_dim:
+                    q = apply_rotary_pos_emb(query.float(), cos, sin, None, 0, rope_mode).to(query.dtype)
+                    k = apply_rotary_pos_emb(key.float(), cos, sin, None, 0, rope_mode).to(key.dtype)
+                    return q.reshape(query_shape), k.reshape(key_shape)
+                q_rot = apply_rotary_pos_emb(query[..., :self.rotary_dim].float(), cos, sin, None, 0,
+                                             rope_mode).to(query.dtype)
+                query = torch.cat((q_rot, query[..., self.rotary_dim:]), dim=-1).reshape(query_shape)
+                k_rot = apply_rotary_pos_emb(key[..., :self.rotary_dim].float(), cos, sin, None, 0,
+                                             rope_mode).to(key.dtype)
+                key = torch.cat((k_rot, key[..., self.rotary_dim:]), dim=-1).reshape(key_shape)
+                return query, key
+            # 'manual': CPU-verified fp32 rotate_half (unfused).
             if self.head_size == self.rotary_dim:
                 query = _apply_rope_fp32(query, cos, sin, self.is_neox_style)
                 key = _apply_rope_fp32(key, cos, sin, self.is_neox_style)
