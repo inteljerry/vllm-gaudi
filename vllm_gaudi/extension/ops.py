@@ -377,6 +377,92 @@ def _naive_prompt_attention(query: torch.Tensor,
 USING_INC = os.getenv("QUANT_CONFIG") is not None
 
 
+def _chunked_prompt_attention(query: torch.Tensor,
+                              key: torch.Tensor,
+                              value: torch.Tensor,
+                              scale: float,
+                              is_causal: bool = False,
+                              attn_bias: Optional[torch.Tensor] = None,
+                              valid_seq_lengths: Optional[torch.Tensor] = None,
+                              matmul_qk_op=torch.matmul,
+                              matmul_av_op=torch.matmul,
+                              sinks: Optional[torch.Tensor] = None,
+                              window_size: Optional[int] = None,
+                              **ignored_args) -> torch.Tensor:
+    """Flash-style prompt attention: tiles the KEY dim under an fp32 online softmax so a long
+    prefill never materializes the full [.., q_len, k_len] scores (naive OOMs at ~197K keys) nor
+    exceeds the FusedSDPA tile ceiling. Online-softmax state (m/l/acc) is fp32 regardless of config;
+    per-chunk QK/AV precision follows matmul_qk_op/matmul_av_op. Bottom-right causal: query i attends
+    keys 0..(k_len-q_len+i). MLA dense prefill only; sinks/sliding-window unsupported.
+    """
+    # sinks/sliding-window would alter the softmax normalization and are unimplemented here
+    assert sinks is None and window_size is None, \
+        'chunked_impl supports neither attention sinks nor sliding window'
+    query = query.transpose(1, 2)
+    key = key.transpose(1, 2)
+    value = value.transpose(1, 2)
+    query_heads = query.size(1)
+    kv_heads = key.size(1)
+    if query_heads != kv_heads:
+        query = query.unflatten(1, (kv_heads, -1))
+        key = key.unflatten(1, (kv_heads, 1))
+        value = value.unflatten(1, (kv_heads, 1))
+        if attn_bias is not None:
+            attn_bias = attn_bias.unsqueeze(2)
+
+    assert attn_bias is not None or is_causal, \
+        'chunked_impl needs is_causal or attn_bias for masking'
+
+    q_len = query.size(-2)
+    k_len = key.size(-2)
+    v_dim = value.size(-1)
+    lead = query.shape[:-2]
+    q = (query * scale).float()
+    # Block-aligned context ([prefix | current | end-pad]) puts end-pad past every query's causal
+    # cutoff, so valid_seq_lengths needs no explicit mask -- the same invariant _fsdpa_ relies on.
+    past = k_len - q_len  # prefix length (0 without prefix cache)
+
+    key_chunk = int(os.getenv('VLLM_PROMPT_CHUNK_SIZE', '8192'))
+    if key_chunk <= 0:
+        key_chunk = k_len
+
+    if is_causal:
+        q_abs = torch.arange(q_len, device=query.device) + past
+
+    m = torch.full((*lead, q_len, 1), float('-inf'), dtype=torch.float32, device=query.device)
+    l = torch.zeros((*lead, q_len, 1), dtype=torch.float32, device=query.device)
+    acc = torch.zeros((*lead, q_len, v_dim), dtype=torch.float32, device=query.device)
+
+    for ks in range(0, k_len, key_chunk):
+        ke = min(ks + key_chunk, k_len)
+        width = ke - ks
+        s = matmul_qk_op(q, key[..., ks:ke, :].float().transpose(-1, -2))  # [*lead, q_len, width]
+        if is_causal:
+            k_pos = torch.arange(ks, ke, device=query.device)
+            allowed = k_pos.unsqueeze(0) <= q_abs.unsqueeze(1)  # [q_len, width]
+            s = s.masked_fill(allowed.reshape(*([1] * len(lead)), q_len, width).logical_not(),
+                              float('-inf'))
+        if attn_bias is not None:
+            b = attn_bias.float()[..., ks:ke]
+            s = s + b
+        chunk_max = s.max(dim=-1, keepdim=True).values
+        m_new = torch.maximum(m, chunk_max)
+        # all-masked-so-far rows stay -inf; sub 0 so exp(-inf - -inf) is 0, not NaN
+        m_safe = torch.where(torch.isinf(m_new), torch.zeros_like(m_new), m_new)
+        p = torch.exp(s - m_safe)
+        corr = torch.exp(m - m_safe)
+        l = l * corr + p.sum(dim=-1, keepdim=True)
+        acc = acc * corr + matmul_av_op(p, value[..., ks:ke, :].float())
+        m = m_new
+        htcore.mark_step()
+
+    attn_weights = (acc / l.clamp_min(1e-20)).to(query.dtype)
+    if query_heads != kv_heads:
+        attn_weights = attn_weights.flatten(1, 2)
+    attn_weights = attn_weights.transpose(1, 2)
+    return attn_weights
+
+
 def _fsdpa_prompt_attention(query: torch.Tensor,
                             key: torch.Tensor,
                             value: torch.Tensor,
@@ -434,6 +520,7 @@ def prompt_attention(
         'naive_impl': _naive_prompt_attention,
         'fsdpa_impl': _fsdpa_prompt_attention,
         'flex_impl': _flex_prompt_attention,
+        'chunked_impl': _chunked_prompt_attention,
     }
     assert impl in impl_mapping, f'Unsupported implementation: {impl}'
     return impl_mapping[impl](**args)

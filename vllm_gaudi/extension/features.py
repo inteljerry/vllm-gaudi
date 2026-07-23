@@ -79,7 +79,8 @@ def get_experimental_flags():
 
 
 def get_features():
-    supported_attn_impls = ['flex_impl', 'fsdpa_impl', 'naive_impl']
+    # order = FirstEnabled precedence (chunked > flex > fsdpa); naive is the always-on fallback
+    supported_attn_impls = ['chunked_impl', 'flex_impl', 'fsdpa_impl', 'naive_impl']
     features = [
         Value('fp32_alibi_biases', True, env_var='VLLM_ALIBI_USE_FLOAT32_BIASES'),
         Value('fp32_softmax', Any(ModelType('qwen2'), ModelType('qwen2_5_vl'))),
@@ -91,6 +92,7 @@ def get_features():
         Value('flex_impl', False, env_var='VLLM_PROMPT_USE_FLEX_ATTENTION'),
         Value('fsdpa_impl', All(Kernel(fsdpa), Not(ModelType('mllama'))), env_var='VLLM_PROMPT_USE_FUSEDSDPA'),
         Value('naive_impl', True),
+        Value('chunked_impl', False, env_var='VLLM_PROMPT_USE_CHUNKED_ATTENTION'),
         ValueFromList('prompt_attn_impl', supported_attn_impls),
         Value('skip_warmup', False),
         Value('merged_prefill', False),
