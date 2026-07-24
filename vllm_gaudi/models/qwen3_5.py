@@ -417,3 +417,71 @@ import vllm.model_executor.models.qwen3_5 as _qwen3_5_module  # noqa: E402
 _gdn_module.QwenGatedDeltaNetAttention = HPUGatedDeltaNetAttention
 _qwen3_next_module.QwenGatedDeltaNetAttention = HPUGatedDeltaNetAttention
 _qwen3_5_module.QwenGatedDeltaNetAttention = HPUGatedDeltaNetAttention
+
+
+def _hpu_qwen3next_decoder_layer_forward(
+    self,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    positions: torch.Tensor = None,
+    **kwargs: object,
+):
+    """Return-based decoder caller for GDN layers (mirrors vLLM 0.24.0 stock forward;
+    re-diff on a vLLM bump). HPUGatedDeltaNetAttention.forward returns its result and
+    leaves ``output`` unwritten, so a linear_attention layer must consume the return;
+    passing the stock ``output=`` buffer leaves it unmaterialized under
+    wrap_in_hpu_graph -> Synapse phantom writeback -> garbage. Only the
+    linear_attention branch differs from stock.
+    """
+    if residual is None:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+    else:
+        hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+    if self.layer_type == "linear_attention":
+        self_attention_output = self.linear_attn(hidden_states=hidden_states)
+    elif self.layer_type == "full_attention":
+        self_attention_output = torch.empty_like(hidden_states)
+        self.self_attn(
+            hidden_states=hidden_states,
+            output=self_attention_output,
+            positions=positions,
+        )
+    else:
+        raise ValueError("Invalid layer_type")
+    hidden_states = self_attention_output
+
+    if self.layer_scale:
+        if len(hidden_states.shape) == 2:
+            hidden_states = hidden_states * (
+                self.attn_layer_scale.to(hidden_states.dtype)[0] + 1
+            )
+        else:
+            hidden_states = hidden_states * (
+                self.attn_layer_scale.to(hidden_states.dtype) + 1
+            )
+
+    # Fully Connected
+    hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+    hidden_states = self.mlp(hidden_states)
+
+    if self.layer_scale:
+        if len(hidden_states.shape) == 2:
+            hidden_states = hidden_states * (
+                self.ffn_layer_scale.to(hidden_states.dtype)[0] + 1
+            )
+        else:
+            assert len(hidden_states.shape) == len(self.ffn_layer_scale.shape), (
+                f"shape must be the same {len(hidden_states.shape)}, "
+                f"{len(self.ffn_layer_scale.shape)}"
+            )
+            hidden_states = hidden_states * (
+                self.ffn_layer_scale.to(hidden_states.dtype) + 1
+            )
+
+    return hidden_states, residual
+
+
+# Qwen3_5DecoderLayer inherits this forward (defines none of its own).
+_qwen3_next_module.Qwen3NextDecoderLayer.forward = _hpu_qwen3next_decoder_layer_forward
