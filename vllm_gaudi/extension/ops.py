@@ -860,6 +860,12 @@ def apply_block_fp8_linear_hpu(
     do_unpad: bool = False,
     force_channel_fp8: bool = False,
 ) -> torch.Tensor:
+    if getattr(layer, 'dense_bf16', False):
+        # Layer's block-FP8 weights were dequantized to dense bf16 at load time
+        # (see fp8_block_linear_postprocess_weights); apply as a plain bf16 linear.
+        input_2d = input.view(-1, input.shape[-1])
+        out = torch.nn.functional.linear(input_2d, layer.weight, bias)
+        return out.to(dtype=input.dtype).view(*input.shape[:-1], -1)
     if force_channel_fp8:
         input_2d = input.view(-1, input.shape[-1])
         output = apply_fp8_linear_hpu(
@@ -989,6 +995,22 @@ def fp8_perchannel_linear_postprocess_weights(layer):
 
 
 def fp8_block_linear_postprocess_weights(layer, force_channel_fp8=False):
+    # VLLM_HPU_DENSE_GDN_BF16 (default on): dequantize the GDN linear_attn
+    # projections from block FP8 to dense bf16 at load time. The GDN math is
+    # numerically sensitive at 256K/FP8, and these projections are small relative
+    # to the MoE experts, so bf16 here costs little memory and avoids per-forward
+    # FP8 dequant. Set 0 to keep them block/channel FP8 like every other layer.
+    if (os.environ.get('VLLM_HPU_DENSE_GDN_BF16', '1') == '1'
+            and 'linear_attn' in getattr(layer, 'prefix', '')):
+        _w, _oM, _oN = pad_block_fp8_weight_naive(
+            layer.weight.data, layer.weight_scale_inv.data, layer.quant_config.weight_block_size)
+        _wbf = dequant_block_fp8_weight_naive(
+            _w, layer.weight_scale_inv.data, layer.quant_config.weight_block_size,
+            dtype=torch.bfloat16, original_M=_oM, original_N=_oN, do_unpad=True)
+        layer.weight = torch.nn.Parameter(_wbf.to(torch.bfloat16), requires_grad=False)
+        layer.dense_bf16 = True
+        htorch.core.mark_step()
+        return layer
     weight, orig_M, orig_N = pad_block_fp8_weight_naive(layer.weight.data, layer.weight_scale_inv.data,
                                                         layer.quant_config.weight_block_size)
     if force_channel_fp8:
@@ -1190,7 +1212,12 @@ class VllmMixtureOfExpertsOpFP8(VllmMixtureOfExpertsOpBase):
         for j in range(self.num_experts):
             w13_list.append(self.w13_list[j].get_dequant_weight())
             w2_list.append(self.w2_list[j].get_dequant_weight())
-        htorch.core.mark_step()
+        # Only fence the dequant list off from the fused op on the SLICED path,
+        # where the mark_step separates expert-group recipes. The monolithic path
+        # (moe_n_slice==1) matches the fork, which issues NO pre-op mark_step — an
+        # extra fence here fragments the decode graph once per MoE layer (60/token).
+        if self.moe_n_slice > 1:
+            htorch.core.mark_step()
 
         if self.moe_n_slice == 1:
             return torch.ops.hpu.mixture_of_experts(hidden_states=x,
@@ -1279,45 +1306,77 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         if self._cached_w13_views is None or self._cached_w2_views is None:
             self._cache_weight_lists()
 
-        w13_list = self._cached_w13_views
-        w2_list = self._cached_w2_views
-        w13_weight_scale = self._cached_w13_scale_views
-        w2_weight_scale = self._cached_w2_scale_views
+        # Rebuild fresh per-expert weight/scale lists every forward (matches the
+        # vllm-fork PerChannel.forward). Cached tuple views built once at load can
+        # present differently to the fused-kernel recipe under
+        # PT_HPUGRAPH_DISABLE_TENSOR_CACHE=1; fresh lists compile the channel
+        # mixture_of_experts reliably.
+        experts_range = range(self.num_experts)
+        w13_list = [self.w13_list[i].weight.squeeze() for i in experts_range]
+        w2_list = [self.w2_list[i].weight.squeeze() for i in experts_range]
+        w13_weight_scale = [self.w13_list[i].scale_inv_fp8.squeeze() for i in experts_range]
+        w2_weight_scale = [self.w2_list[i].scale_inv_fp8.squeeze() for i in experts_range]
 
+        topk_ids_i64 = topk_ids.to(torch.int64)
+        topk_weights_c = topk_weights.to(x.dtype)
+
+        # Quantize the activation ONCE — x is the same input for every expert group,
+        # so slicing experts must NOT re-quantize x per slice.
         if self.w13_input_scale is None:
             x_fp8, x_scale = dynamic_quant(x)
-            final_hidden_states = torch.ops.hpu.mixture_of_experts(hidden_states=x_fp8,
-                                                                   expert_routing_table=topk_ids.to(torch.int64),
-                                                                   router_weights=topk_weights.to(x.dtype),
-                                                                   w12=w13_list,
-                                                                   w3=w2_list,
-                                                                   d_scale_hidden_states=x_scale,
-                                                                   d_scale_w12=w13_weight_scale,
-                                                                   d_scale_w3=w2_weight_scale,
-                                                                   permuted_weights=permuted_weights,
-                                                                   activation=activation,
-                                                                   experts_min=self.experts_min,
-                                                                   experts_max=self.experts_max,
-                                                                   **kwargs)
+            w2_input_scale = None
         else:
             x_scale = self.w13_input_scale.data
             # w2_input_scale should be List[Tensor] when static and fused
             w2_input_scale = [self.w2_input_scale[i] for i in range(self.num_experts)]
             x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0 / x_scale, False, False, torch.float8_e4m3fn)[0]
-            final_hidden_states = torch.ops.hpu.mixture_of_experts(hidden_states=x_fp8,
-                                                                   expert_routing_table=topk_ids.to(torch.int64),
-                                                                   router_weights=topk_weights.to(x.dtype),
-                                                                   w12=w13_list,
-                                                                   w3=w2_list,
-                                                                   d_scale_hidden_states=x_scale,
-                                                                   d_scale_intermediate_hidden_states=w2_input_scale,
-                                                                   d_scale_w12=w13_weight_scale,
-                                                                   d_scale_w3=w2_weight_scale,
-                                                                   permuted_weights=permuted_weights,
-                                                                   activation=activation,
-                                                                   experts_min=self.experts_min,
-                                                                   experts_max=self.experts_max,
-                                                                   **kwargs)
+
+        def _run_experts(w12, w3, dsw12, dsw3, emin, emax, ds_inter):
+            # ds_inter (d_scale_intermediate_hidden_states) is only passed on the
+            # static-input-scale path, matching the original monolithic kernel calls.
+            extra = {} if ds_inter is None else {"d_scale_intermediate_hidden_states": ds_inter}
+            return torch.ops.hpu.mixture_of_experts(hidden_states=x_fp8,
+                                                    expert_routing_table=topk_ids_i64,
+                                                    router_weights=topk_weights_c,
+                                                    w12=w12,
+                                                    w3=w3,
+                                                    d_scale_hidden_states=x_scale,
+                                                    d_scale_w12=dsw12,
+                                                    d_scale_w3=dsw3,
+                                                    permuted_weights=permuted_weights,
+                                                    activation=activation,
+                                                    experts_min=emin,
+                                                    experts_max=emax,
+                                                    **extra,
+                                                    **kwargs)
+
+        if self.moe_n_slice == 1:
+            # Monolithic single-kernel path (small expert counts).
+            return _run_experts(w13_list, w2_list, w13_weight_scale, w2_weight_scale, self.experts_min,
+                                self.experts_max, w2_input_scale)
+
+        # Sliced channel path: the monolithic large-expert fused kernel can fail to
+        # compile, which would otherwise force the block op (re-dequants all experts
+        # every forward, ~4x slower decode). Slice the experts into moe_n_slice
+        # groups with a mark_step between them (same fencing as
+        # VllmMixtureOfExpertsOpFP8) so the fused-kernel recipe compiles while
+        # keeping the fast cached-channel weights. The leading mark_step fences the
+        # sliced recipes off from the preceding dynamic_quant / router ops.
+        htorch.core.mark_step()
+        g = self.num_expert_per_group
+        final_hidden_states = None
+        for i in range(self.moe_n_slice):
+            sl = slice(i * g, (i + 1) * g)
+            emin = self.experts_min + i * g
+            emax = emin + g - 1
+            ds_inter = w2_input_scale[i * g:(i + 1) * g] if w2_input_scale is not None else None
+            slice_hidden_states = _run_experts(w13_list[sl], w2_list[sl], w13_weight_scale[sl], w2_weight_scale[sl],
+                                               emin, emax, ds_inter)
+            htorch.core.mark_step()
+            if i == 0:
+                final_hidden_states = slice_hidden_states
+            else:
+                final_hidden_states += slice_hidden_states
 
         return final_hidden_states
 

@@ -15,6 +15,14 @@ import math
 T = TypeVar("T")
 U = TypeVar("U")
 
+# VLLM_H2D_BLOCKING=1 forces synchronous host->device copies in async_h2d_copy/update.
+# Default (async) is fine on HPU; the escape hatch exists because an untracked async
+# H2D copy into a fresh torch.empty_like target can be read by the op before it
+# completes, yielding uninitialized index/metadata tensors (state_indices,
+# query_start_loc, mamba block maps). Set 1 to serialize the copy when debugging such
+# a read-before-write race.
+_H2D_NON_BLOCKING = os.getenv("VLLM_H2D_BLOCKING", "0") != "1"
+
 
 @cache
 def is_fake_hpu() -> bool:
@@ -53,16 +61,16 @@ def async_h2d_copy(source, dest_tensor=None, dtype=None, device="hpu"):
     if isinstance(source, torch.Tensor):
         if dest_tensor is not None:
             # Copy into pre-allocated destination tensor
-            return dest_tensor.copy_(source, non_blocking=True)
+            return dest_tensor.copy_(source, non_blocking=_H2D_NON_BLOCKING)
         # Create new device tensor and copy
         assert source.device.type == "cpu", "Source tensor must be on CPU for asynchronous transfer"
         target = torch.empty_like(source, device=device)
-        return target.copy_(source, non_blocking=True)
+        return target.copy_(source, non_blocking=_H2D_NON_BLOCKING)
     # Create tensor from data and transfer to device
     if dtype is None:
         raise ValueError("dtype must be specified when source is not a tensor")
     cpu_tensor = torch.tensor(source, dtype=dtype, device="cpu")
-    return cpu_tensor.to(device, non_blocking=True)
+    return cpu_tensor.to(device, non_blocking=_H2D_NON_BLOCKING)
 
 
 def async_h2d_update(source: torch.Tensor, dest: torch.Tensor, indices: list[int], device="hpu"):
@@ -76,7 +84,7 @@ def async_h2d_update(source: torch.Tensor, dest: torch.Tensor, indices: list[int
         device: Target device
     """
     idx = torch.tensor(indices, dtype=torch.long, device=device)
-    vals = source[indices].to(device, non_blocking=True)
+    vals = source[indices].to(device, non_blocking=_H2D_NON_BLOCKING)
     dest.index_copy_(0, idx, vals)
 
 

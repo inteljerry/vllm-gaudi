@@ -484,6 +484,19 @@ def hpu_causal_conv1d_fn_update(
     out = seq_out
 
     with torch.no_grad():
-        conv_states[safe_cache_idx, -state_len:, :] = new_state.transpose(-1, -2)
+        # Commit the decode conv-state write with a DIM-0 index_copy_, not a
+        # partial in-place slice write.  Under wrap_in_hpu_graph(
+        # disable_tensor_cache=True) the slice write
+        #   conv_states[safe_cache_idx, -state_len:, :] = ...
+        # lowers to an hpu::slice_insert that earns no control_edge, so the fuser
+        # may discard the persistent conv buffer's storage and the conv graph input
+        # comes up empty ("Strided Params Has Value: 0" at linear_attn/hpu__input).
+        # The ssm state survives because it is committed with a dim-0 index_copy_
+        # (see hpu_gdn_pytorch._save_recurrent_ssm_state); mirror that here — build
+        # the full updated slot on a fresh tensor, then commit it with index_copy_
+        # so conv_states is kept live across the capture boundary like the ssm state.
+        new_slots = conv_states.index_select(0, safe_cache_idx).clone()
+        new_slots[:, -state_len:, :] = new_state.transpose(-1, -2).to(new_slots.dtype)
+        conv_states.index_copy_(0, safe_cache_idx, new_slots)
 
     return out.to(original_dtype)

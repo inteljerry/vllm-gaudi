@@ -24,9 +24,9 @@ logger = init_logger()
 # implementation — useful for debugging accuracy issues.
 _USE_LEGACY_PHASE_B = os.getenv("VLLM_GDN_LEGACY_PHASE_B", "0") == "1"
 
-# Set VLLM_GDN_COMPUTE_FP32=1 to use float32 instead of bfloat16 for GDN
-# compute ops (preprocess casts, decode path, state buffers).  bf16 is
-# the default for performance; fp32 is useful for debugging accuracy.
+# VLLM_GDN_COMPUTE_FP32 controls the GDN compute dtype (preprocess casts, decode
+# path, state buffers).  Default 1 -> float32 (numerically safe for the 256K/FP8
+# Qwen3.5 path); set 0 for bfloat16.
 _GDN_COMPUTE_DTYPE = torch.float32 if os.getenv("VLLM_GDN_COMPUTE_FP32", "1") == "1" else torch.bfloat16
 
 # Set VLLM_GDN_EXACT_SOLVE=1 to use exact row-by-row forward substitution
@@ -82,7 +82,7 @@ def hpu_chunk_gdr_preprocess(
     if scale is None:
         scale = k.shape[-1]**-0.5
 
-    # Compute dtype controlled by VLLM_GDN_COMPUTE_FP32 env var (default: bf16)
+    # Compute dtype controlled by VLLM_GDN_COMPUTE_FP32 env var (default: fp32)
     qf = q.reshape(-1, H, Kdim).to(_GDN_COMPUTE_DTYPE)
     kf = k.reshape(-1, H, Kdim).to(_GDN_COMPUTE_DTYPE)
     vf = v.reshape(-1, HV, Vdim).to(_GDN_COMPUTE_DTYPE)
@@ -255,7 +255,7 @@ def hpu_chunk_gdr_phase_b(
 
 
 def _eager_reshape_output(core_h, S, padded_len, seq_len, H, Vdim):
-    """Reshape core_h to output tensor in eager mode."""
+    """Reshape a CHUNK-MAJOR [S,C,H,tc,V] core_h to output in eager mode."""
     return core_h.permute(0, 1, 3, 2, 4).reshape(S, padded_len, H, Vdim)[:, :seq_len, :, :].reshape(-1, H, Vdim)
 
 
@@ -289,49 +289,56 @@ def _hpu_chunk_gdr_phase_b_optimized(
     device = u_all.device
     compute_dtype = q_chunks.dtype
 
-    # [S, C, H, ...]
+    # [S,C,tc,H,X] -> [S,C,H,tc,X]
     u_h = u_all.permute(0, 1, 3, 2, 4).to(compute_dtype)
     w_h = w_all.permute(0, 1, 3, 2, 4).to(compute_dtype)
     q_h = q_chunks.permute(0, 1, 3, 2, 4)
     k_h = k_chunks.permute(0, 1, 3, 2, 4).to(compute_dtype)
     g_h = g_chunks.permute(0, 1, 3, 2)
 
-    g_last = g_h[..., -1:]  # [S,C,H,1]
+    g_last = g_h[..., -1:]  # [...,tc]->[...,1]
     g_exp = torch.exp(g_h).to(compute_dtype)
     delta_exp = torch.exp(g_last - g_h).to(compute_dtype)
     pair_decay = torch.exp(g_h.unsqueeze(-1) - g_h.unsqueeze(-2)).to(compute_dtype)
 
     # Output decomposition:
     # out = (A @ U + (Q - A @ W) @ state_t) * scale
-    A = torch.matmul(q_h, k_h.transpose(-1, -2))  # [S,C,H,tc,tc]
+    A = torch.matmul(q_h, k_h.transpose(-1, -2))  # [...,tc,tc]
     A = torch.tril(A * pair_decay)
 
-    core_h = torch.matmul(A, u_h) * scale  # [S,C,H,tc,V]
-    Q = q_h * g_exp.unsqueeze(-1)  # [S,C,H,tc,K]
-    C_h = (Q - torch.matmul(A, w_h)) * scale  # [S,C,H,tc,K]
+    core_h = torch.matmul(A, u_h) * scale  # [...,tc,V]
+    Q = q_h * g_exp.unsqueeze(-1)  # [...,tc,K]
+    C_h = (Q - torch.matmul(A, w_h)) * scale  # [...,tc,K]
 
     # State decomposition:
     # new_state = alpha * state + N - state @ R
     # => in transposed layout state_t=[K,V]:
     # new_state_t = (alpha*I - R^T) @ state_t + N^T
-    u_decay = u_h * delta_exp.unsqueeze(-1)  # [S,C,H,tc,V]
-    w_decay = w_h * delta_exp.unsqueeze(-1)  # [S,C,H,tc,K]
+    u_decay = u_h * delta_exp.unsqueeze(-1)  # [...,tc,V]
+    w_decay = w_h * delta_exp.unsqueeze(-1)  # [...,tc,K]
 
-    N = torch.matmul(u_decay.transpose(-1, -2), k_h)  # [S,C,H,V,K]
-    R = torch.matmul(w_decay.transpose(-1, -2), k_h)  # [S,C,H,K,K]
+    N = torch.matmul(u_decay.transpose(-1, -2), k_h)  # [...,V,K]
+    R = torch.matmul(w_decay.transpose(-1, -2), k_h)  # [...,K,K]
 
-    N_t = N.transpose(-1, -2)  # [S,C,H,K,V]
+    N_t = N.transpose(-1, -2)  # [...,K,V]
 
     alpha = torch.exp(g_last).unsqueeze(-1).to(compute_dtype)
     k_eye = torch.eye(Kdim, dtype=compute_dtype, device=device).view(1, 1, 1, Kdim, Kdim)
-    M_full = alpha * k_eye - R.transpose(-1, -2)  # [S,C,H,K,K]
+    M_full = alpha * k_eye - R.transpose(-1, -2)  # [...,K,K]
 
     state_t = init_state.to(compute_dtype).transpose(-1, -2)  # [S,H,K,V]
 
+    # C is axis 1: core_h [S,C,H,tc,V], state_t [S,H,K,V].  Accumulate the
+    # inter-chunk corrections functionally (list + torch.stack + non-in-place add)
+    # rather than an in-place .add_ into a slice-view of core_h: HPU Graphs do not
+    # support capturing in-place view updates, so under graph capture the per-chunk
+    # writes are non-deterministically dropped.  Each correction uses state_t before
+    # this chunk's update, so the result is numerically identical to the in-place scan.
+    corr = []
     for ci in range(num_chunks):
-        core_h[:, ci].add_(torch.matmul(C_h[:, ci], state_t))
+        corr.append(torch.matmul(C_h[:, ci], state_t))  # [S,H,tc,V]
         state_t = torch.matmul(M_full[:, ci], state_t) + N_t[:, ci]
-
+    core_h = core_h + torch.stack(corr, dim=1)  # -> [S,C,H,tc,V]
     out = _eager_reshape_output(core_h, S, padded_len, seq_len, H, Vdim)
 
     final_state = None
@@ -537,6 +544,33 @@ def _eager_read_state(state: torch.Tensor, idx: torch.Tensor, dtype: torch.dtype
     return state.index_select(0, idx).to(dtype)
 
 
+@torch._dynamo.disable
+def _save_recurrent_ssm_state(out_pass_through, final_state, sidx, h_batch):
+    """Eager-only decode SSM-state write — the symmetric partner of _eager_read_state.
+
+    Must be @torch._dynamo.disable: in the decode fast path ``final_state`` is
+    the ALIASED ssm_state cache (inplace_final_state=True, initial_state=ssm_state)
+    and the caller discards the returned final_state, so this in-place index_copy_
+    is the SOLE thing that advances decode state across steps.  HPU torch.compile
+    silently drops a dynamo-traced in-place index_copy_ to an aliased state tensor
+    (the same hazard the prefill _save_ssm_state and the general path's write at
+    _recurrent_general_path guard); if dropped here, ssm_state never advances and
+    generation freezes on step-0 state.  Only the write needs the graph break —
+    the vectorized decode compute stays compiled for tok/s.
+
+    ``@torch._dynamo.disable`` alone is necessary but NOT sufficient: HPU also
+    drops a dynamo-disabled call whose result is unused, so this returns the
+    consumed decode output ``out_pass_through`` (which flows on to the gated norm
+    / out_proj) as a pass-through — giving the compiled graph a live consumer of
+    this call so the index_copy_ cannot be DCE'd.  Mirrors the prefill guard
+    ``_save_ssm_state`` (returns core_attn_out) and the fork's ``_save_ssm_state``
+    (vllm-fork qwen3_next.py:92, threaded through decode at :731).  ``final_state``
+    is written in place, so the caller reads the advanced state from its own alias.
+    """
+    final_state.index_copy_(0, sidx, h_batch.to(final_state.dtype))
+    return out_pass_through
+
+
 def hpu_fused_recurrent_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -611,7 +645,7 @@ def hpu_fused_recurrent_gated_delta_rule(
         h_batch = _eager_read_state(final_state, sidx, _GDN_COMPUTE_DTYPE)
 
         # Flatten token axis.
-        # Compute dtype controlled by VLLM_GDN_COMPUTE_FP32 env var (default: bf16)
+        # Compute dtype controlled by VLLM_GDN_COMPUTE_FP32 env var (default: fp32)
         qf = q.reshape(-1, H, Kdim).to(_GDN_COMPUTE_DTYPE)
         kf = k.reshape(-1, H, Kdim).to(_GDN_COMPUTE_DTYPE)
         vf = v.reshape(-1, HV, Vdim).to(_GDN_COMPUTE_DTYPE)
@@ -632,11 +666,18 @@ def hpu_fused_recurrent_gated_delta_rule(
         h_batch = h_batch + v_new.unsqueeze(-1) * kf.unsqueeze(2)
         out_batch = torch.matmul(h_batch, q_s.unsqueeze(-1)).squeeze(-1)
 
-        # Direct index_copy_ (no eager wrapper for this test).
-        final_state.index_copy_(0, sidx, h_batch.to(final_state.dtype))
         out_full = out_batch.to(v.dtype)
 
-        out_result = out_full.unsqueeze(0) if cu_seqlens is not None else out_full.view(B, T, HV, Vdim)
+        # .contiguous(): unsqueeze/view yields a strided view that can reach
+        # the gated-norm / out_proj unmaterialized on the HPU lazy graph.
+        # Return a dense op-output the graph cannot drop (see prefill path).
+        out_result = (out_full.unsqueeze(0) if cu_seqlens is not None else out_full.view(B, T, HV, Vdim)).contiguous()
+
+        # Persist decode state through the dynamo-disabled write helper, threading
+        # the CONSUMED out_result through it (not the discarded final_state) so the
+        # compiled graph has a live consumer of the call and cannot DCE the aliased
+        # index_copy_ — the sole thing advancing ssm_state across decode steps.
+        out_result = _save_recurrent_ssm_state(out_result, final_state, sidx, h_batch)
         return out_result, final_state
 
     # --- General (multi-token) fallback path ---
@@ -783,7 +824,8 @@ def _recurrent_general_path(
     final_state.copy_(state_work.to(final_state.dtype))
     out = out.to(v.dtype)
 
-    out = out.unsqueeze(0) if cu_seqlens is not None else out.view(B, T, HV, Vdim)
+    # .contiguous(): dense op-output, not a strided view (see prefill path).
+    out = (out.unsqueeze(0) if cu_seqlens is not None else out.view(B, T, HV, Vdim)).contiguous()
 
     return out, final_state
 
@@ -877,7 +919,15 @@ def hpu_chunk_gated_delta_rule(
             output_dtype=initial_state.dtype if initial_state is not None else None,
         )
 
-        out = out.to(q.dtype).view(B, T, H_c, Vdim)
+        # .contiguous(): return a dense, materialized tensor instead of the
+        # strided view chain produced by _eager_reshape_output
+        # (permute/reshape/slice/reshape).  On the HPU lazy graph that view
+        # chain can reach the gated-norm / out_proj UNMATERIALIZED (observed
+        # as core_attn_out sum ~= 6.87e-41 denormal at TP8/FP8/256K); forcing a
+        # contiguous copy makes this a real op-output the graph cannot drop.
+        # Mirrors the fork, which returns core_attn_out built from matmul +
+        # in-place add on a genuine buffer (torch_gated_delta_rule.py:140-163).
+        out = out.to(q.dtype).reshape(B, T, H_c, Vdim).contiguous()
         return out, final_state
 
     # ---- Legacy paths (cu_seqlens / non-bucketed) ----
@@ -1141,7 +1191,9 @@ def _hpu_chunk_gated_delta_rule_legacy(
                 final_state[seq_id] = state
 
     out = out.to(q.dtype)
-    out = out.unsqueeze(0) if cu_seqlens is not None else out.view(B, T, H, Vdim)
+    # .contiguous(): dense op-output, not a strided view (see the bucketed
+    # prefill path above for the HPU materialization rationale).
+    out = (out.unsqueeze(0) if cu_seqlens is not None else out.view(B, T, H, Vdim)).contiguous()
 
     if final_state is None:
         return out, None

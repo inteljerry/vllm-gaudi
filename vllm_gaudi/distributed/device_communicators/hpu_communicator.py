@@ -40,8 +40,17 @@ class HpuCommunicator(DeviceCommunicatorBase):
         # occurring when PT_HPU_ENABLE_LAZY_COLLECTIVES=true env var is used
         # (which is required for tensor parallel HPUGraph inference)
         htorch.core.mark_step()
-        dist.all_reduce(input_, group=self.device_group)
-        return input_
+        # The mark_step() above segments the graph; under
+        # wrap_in_hpu_graph(disable_tensor_cache=True) a tensor crossing that
+        # boundary (e.g. an out_proj FP8 matmul output) has its storage freed, so
+        # an in-place all_reduce(input_) writes back into a freed buffer and fails
+        # graph capture ("Strided Params Has Value: 0" at .../linear_attn/out_proj).
+        # Allocate a fresh destination in this post-mark_step segment so the
+        # collective writes into live storage; its READ of input_ is unaffected.
+        output = torch.empty_like(input_)
+        output.copy_(input_)
+        dist.all_reduce(output, group=self.device_group)
+        return output
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size

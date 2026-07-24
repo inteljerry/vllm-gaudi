@@ -259,6 +259,35 @@ class HpuPlatform(Platform):
         # Disable multi-stream for shared experts as no Stream on CPU
         os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
+        # HPU long-context prefill default. get_device_total_memory() returns 0 (a test
+        # workaround, see that method), so upstream get_batch_defaults() falls back to the
+        # OPENAI_API_SERVER default max_num_batched_tokens=2048 -- which, with chunked
+        # prefill, splits every long prompt into 2048-token forwards (measured 3-5x slower
+        # TTFT on long context). Only when the value is that untouched 2048 default (any
+        # other value is a real override and is left alone) and the model context is larger,
+        # raise it to a large-device budget; 16384 is the empirical Gaudi3 knee. Block-aligned
+        # for tidiness -- a value not divisible by the model's mamba_chunk_size (hybrid
+        # GDN/Mamba) would fail loudly at the bucketing check (extension/bucketing/common.py),
+        # never silently, so any override stays safe.
+        sched_config = vllm_config.scheduler_config
+        if (sched_config is not None and model_config is not None and cache_config is not None
+                and sched_config.enable_chunked_prefill
+                and sched_config.max_num_batched_tokens == 2048        # untouched HPU default
+                and model_config.max_model_len > 2048):
+            target = int(os.getenv("VLLM_HPU_DEFAULT_MAX_NUM_BATCHED_TOKENS", "16384"))
+            block = cache_config.block_size or 128
+            new_mbt = (min(model_config.max_model_len, target) // block) * block
+            if new_mbt > sched_config.max_num_batched_tokens:   # guard: max_model_len just >2048 can round below 2048
+                logger.info(
+                    "[HPU] Raising max_num_batched_tokens 2048 -> %d for long-context prefill "
+                    "(get_device_total_memory()==0 forces the 2048 default). Set "
+                    "--max-num-batched-tokens or VLLM_HPU_DEFAULT_MAX_NUM_BATCHED_TOKENS to override.",
+                    new_mbt)
+                sched_config.max_num_batched_tokens = new_mbt
+                # __post_init__ derived exactly these two from the old value; keep them consistent.
+                sched_config.max_num_encoder_input_tokens = new_mbt
+                sched_config.encoder_cache_size = new_mbt
+
         # NOTE: vLLM has default enabled async scheduling with speculative decoding is on.
         # However, for HPU, speculative decoding is not supported with async scheduling.
         vllm_config.scheduler_config.async_scheduling = \
