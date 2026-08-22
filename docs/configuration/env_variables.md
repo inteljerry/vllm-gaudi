@@ -21,6 +21,7 @@ This document lists the supported diagnostic and profiling, as well as performan
 | Parameter name               | Description                                                   | Default value |
 | ---------------------------- | ------------------------------------------------------------- | ------------- |
 | `VLLM_GRAPH_RESERVED_MEM`    | Percentage of memory dedicated to HPUGraph capture.           | `0.1`         |
+| `VLLM_FP32_ROPE`             | Computes rotary position embeddings in fp32 (base `HPURotaryEmbedding` only; scaled-rope subclasses ignore it) to avoid the bf16 phase-noise floor that grows with position. `fused`/`1`/`true`/`on` routes through the fused Habana kernel in fp32; `manual` uses an unfused rotate_half fallback. Improves byte-exact long-context fidelity; small prefill cost, zero KV cost. | unset (off) |
 | `VLLM_BUCKETING_STRATEGY`    | Selects the bucketing strategy: `exp`, `lin`, or `pad`.      | `exp`         |
 | `VLLM_EXPONENTIAL_BUCKETING` | Deprecated compatibility flag. If set, it overrides `VLLM_BUCKETING_STRATEGY`: `true` forces `exp`, `false` forces `lin`. It cannot select `pad` and will be removed in a future release. | `None`        |
 | `VLLM_BUCKETING_FROM_FILE`   | Enables reading bucket configuration from file.              | `None`        |

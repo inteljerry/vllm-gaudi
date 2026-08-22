@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 import torch
@@ -10,9 +11,64 @@ from vllm.model_executor.layers.rotary_embedding import (RotaryEmbedding, Phi3Lo
 from vllm.model_executor.custom_op import CustomOp
 
 
+def _fp32_rope_mode() -> str:
+    """VLLM_FP32_ROPE (base HPURotaryEmbedding only; scaled-rope subclasses ignore it):
+      '1'/'true'/'on'/'fused' -> 'fused': fp32 cos/sin fed to the fused Habana apply_rotary_pos_emb
+                                 (one kernel; the kernel honors fp32 -- hardware-verified byte-exact);
+      'manual'                -> manual fp32 rotate_half (CPU bit-exact vs vLLM canonical; same
+                                 fidelity and perf as fused, kept as a verifiable fallback);
+      else / unset            -> off (fused bf16 kernel).
+    fp32 RoPE fixes byte-exact long-context copy (bf16 RoPE phase-noise cliffs ~196.6K). It costs
+    ~20% decode tok/s at SHORT ctx but only ~3% at 128K-256K (decode is KV-bound there), so it is
+    opt-in -- enable for long-context byte-exact-transcription workloads."""
+    v = (os.environ.get('VLLM_FP32_ROPE') or '').lower()
+    if v in ('1', 'true', 't', 'yes', 'y', 'on', 'fused'):
+        return 'fused'
+    if v == 'manual':
+        return 'manual'
+    return 'off'
+
+
+def _apply_rope_fp32(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, is_neox: bool) -> torch.Tensor:
+    """RoPE rotation computed in fp32, downcast to x's dtype on return. fp32 avoids the bf16
+    phase-noise floor that grows with position and degrades long-context positional fidelity."""
+    orig_dtype = x.dtype
+    xf = x.float()
+    cf = cos.float()
+    sf = sin.float()
+    if is_neox:
+        d = xf.shape[-1] // 2
+        rot = torch.cat((-xf[..., d:], xf[..., :d]), dim=-1)
+    else:
+        x1 = xf[..., 0::2]
+        x2 = xf[..., 1::2]
+        rot = torch.stack((-x2, x1), dim=-1).flatten(-2)
+    return (xf * cf + rot * sf).to(orig_dtype)
+
+
 @RotaryEmbedding.register_oot
 class HPURotaryEmbedding(RotaryEmbedding):
     """Original rotary positional embedding."""
+
+    def _fp32_cos_sin(self, positions: torch.Tensor, offsets: Optional[torch.Tensor]):
+        """Per-token cos/sin from a true-fp32 cache (recomputed once), not the bf16 cos_sin_cache buffer."""
+        if getattr(self, '_cos_sin_cache_fp32', None) is None:
+            # base _compute_cos_sin_cache returns fp32; the registered buffer was downcast to bf16.
+            self._cos_sin_cache_fp32 = self._compute_cos_sin_cache().to(self.cos_sin_cache.device)
+        pos = positions
+        if offsets is not None:
+            pos = pos + offsets.view(pos.shape[0], -1)
+        pos = pos.flatten()
+        num_tokens = pos.shape[0]
+        cos_sin = self._cos_sin_cache_fp32.index_select(0, pos).view(num_tokens, 1, -1)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        if self.is_neox_style:
+            cos = torch.cat((cos, cos), dim=-1)
+            sin = torch.cat((sin, sin), dim=-1)
+        else:
+            sin = torch.repeat_interleave(sin, 2, dim=-1, output_size=cos_sin.shape[-1])
+            cos = torch.repeat_interleave(cos, 2, dim=-1, output_size=cos_sin.shape[-1])
+        return cos, sin
 
     def prepare_cos_sin(self,
                         positions: torch.Tensor,
@@ -43,6 +99,43 @@ class HPURotaryEmbedding(RotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from habana_frameworks.torch.hpex.kernels import (RotaryPosEmbeddingMode, apply_rotary_pos_emb)
+
+        # fp32 RoPE (VLLM_FP32_ROPE): rotate from a true-fp32 cos/sin cache to avoid the bf16
+        # phase-noise floor at large positions; math matches the kernel path below.
+        num_tokens = positions.numel()
+        fp32_mode = _fp32_rope_mode()
+        if fp32_mode != 'off':
+            cos, sin = self._fp32_cos_sin(positions, offsets)
+            query_shape = query.shape
+            key_shape = key.shape
+            query = query.view(num_tokens, -1, self.head_size)
+            key = key.view(num_tokens, -1, self.head_size)
+            if fp32_mode == 'fused':
+                # 'fused': feed fp32 cos/sin + fp32 q/k to the ONE fused Habana kernel instead of
+                # the ~14 unfused manual ops, recovering kernel speed if the kernel honors fp32.
+                rope_mode = (RotaryPosEmbeddingMode.BLOCKWISE
+                             if self.is_neox_style else RotaryPosEmbeddingMode.PAIRWISE)
+                if self.head_size == self.rotary_dim:
+                    q = apply_rotary_pos_emb(query.float(), cos, sin, None, 0, rope_mode).to(query.dtype)
+                    k = apply_rotary_pos_emb(key.float(), cos, sin, None, 0, rope_mode).to(key.dtype)
+                    return q.reshape(query_shape), k.reshape(key_shape)
+                q_rot = apply_rotary_pos_emb(query[..., :self.rotary_dim].float(), cos, sin, None, 0,
+                                             rope_mode).to(query.dtype)
+                query = torch.cat((q_rot, query[..., self.rotary_dim:]), dim=-1).reshape(query_shape)
+                k_rot = apply_rotary_pos_emb(key[..., :self.rotary_dim].float(), cos, sin, None, 0,
+                                             rope_mode).to(key.dtype)
+                key = torch.cat((k_rot, key[..., self.rotary_dim:]), dim=-1).reshape(key_shape)
+                return query, key
+            # 'manual': CPU-verified fp32 rotate_half (unfused).
+            if self.head_size == self.rotary_dim:
+                query = _apply_rope_fp32(query, cos, sin, self.is_neox_style)
+                key = _apply_rope_fp32(key, cos, sin, self.is_neox_style)
+                return query.reshape(query_shape), key.reshape(key_shape)
+            q_rot = _apply_rope_fp32(query[..., :self.rotary_dim], cos, sin, self.is_neox_style)
+            query = torch.cat((q_rot, query[..., self.rotary_dim:]), dim=-1).reshape(query_shape)
+            k_rot = _apply_rope_fp32(key[..., :self.rotary_dim], cos, sin, self.is_neox_style)
+            key = torch.cat((k_rot, key[..., self.rotary_dim:]), dim=-1).reshape(key_shape)
+            return query, key
 
         # Prepare cos-sin caches for long-context + LoRA with offsets for every
         # forward, since the offset information wasn't available previously
