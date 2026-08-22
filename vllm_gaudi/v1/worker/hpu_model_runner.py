@@ -4431,6 +4431,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # Collect per-request prefill hidden states for prompt logprobs.
         prefill_hidden_states_for_logprobs: dict[str, torch.Tensor] = {}
         decode_sampled_token_ids_device = None
+        # sampling_metadata is only bound when the sampler actually ran this
+        # step; intermediate chunked-prefill chunks produce no logits and
+        # never bind it. Initialize so the spec-decode block below can guard
+        # on it safely.
+        sampling_metadata = None
         # NOTE(tianmu-li): For structured output, combine logits before
         # postprocessing. Should it be done for all requests?
         self.use_structured_output = False
@@ -4742,14 +4747,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             req_state.output_token_ids.extend(sampled_ids)
 
         ################## Spec Decode ##################
-        # Now, we will call drafter to propose draft token ids
-        if self.speculative_config:
+        # Now, we will call drafter to propose draft token ids.
+        # Skip steps where nothing was sampled: an intermediate chunked
+        # prefill chunk generates no logits, so sampling_metadata was never
+        # bound and there are no fresh tokens to propose drafts from.
+        if self.speculative_config and (num_decodes > 0 or prefill_sampled_token_ids):
             self._draft_token_ids = self.propose_draft_token_ids(
                 scheduler_output, postprocessed_sampled_token_ids, sampling_metadata, non_flattened_hidden_states,
                 sample_hidden_states, aux_hidden_states, prefill_sampled_token_ids_device,
                 decode_sampled_token_ids_device, non_flattened_hidden_states_prefills, sample_hidden_states_prefills,
                 aux_hidden_states_prefills, num_decodes, prefill_data if num_prefills > 0 else None,
                 decode_data if num_decodes > 0 else None)
+        elif self.speculative_config:
+            self._draft_token_ids = None
         ################## Spec Decode end ##################
 
         # Create output.

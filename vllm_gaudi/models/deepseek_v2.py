@@ -2,6 +2,7 @@ import torch
 from itertools import islice
 
 from vllm.distributed import get_pp_group
+from vllm.model_executor.models import deepseek_mtp
 from vllm.model_executor.models import deepseek_v2
 from vllm.sequence import IntermediateTensors
 
@@ -108,3 +109,31 @@ def _hpu_deepseek_v2_model_load_weights(self, weights):
 
 
 deepseek_v2.DeepseekV2Model.load_weights = _hpu_deepseek_v2_model_load_weights
+
+
+def _hpu_restore_full_token_layout_if_needed(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    num_tokens: int,
+    is_sequence_parallel: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """HPU variant of deepseek_mtp._restore_full_token_layout_if_needed.
+
+    Same shape-contract mismatch as _hpu_deepseek_v2_model_forward above:
+    the upstream guard ``hidden_states.shape[0] == num_tokens`` assumes the
+    GPU layout (flat 2D [num_tokens, H] hidden_states, 1D positions). On HPU
+    positions is 2D [bs, seq] so num_tokens == bs, while DeepseekV2MoE
+    flattens hidden_states to [bs*seq, H] and residual stays [bs, seq, H].
+    The guard fires spuriously on every prefill proposal (seq > 1) and the
+    SP all-gather cat crashes on the 2D-vs-3D mismatch. HPU MoE kernels
+    handle expert parallelism internally (and use_sequence_parallel_moe
+    requires data_parallel_size > 1 anyway), so the all-gather is dead here;
+    just normalize both to token-major [bs*seq, H] for the residual add.
+    """
+    if hidden_states.dim() != residual.dim():
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        residual = residual.view(-1, residual.shape[-1])
+    return hidden_states, residual
+
+
+deepseek_mtp._restore_full_token_layout_if_needed = _hpu_restore_full_token_layout_if_needed

@@ -47,7 +47,9 @@ class HpuEagleProposer(EagleProposer):
 
         # All MTP related method names are now unified to "mtp"
         if self.method == "mtp":
-            last_hidden_states = ret_hidden_states
+            # DeepSeek-family MTP (deepseek_mtp.py) recycles the post-final-norm
+            # hidden, so its forward returns a (logit_hidden, recycle_hidden) tuple.
+            last_hidden_states = ret_hidden_states[0] if isinstance(ret_hidden_states, tuple) else ret_hidden_states
             hidden_states = last_hidden_states
         else:
             last_hidden_states, hidden_states = ret_hidden_states
@@ -114,8 +116,8 @@ class HpuEagleProposer(EagleProposer):
                 attn_metadata=attn_metadata,
             )
             if self.method == "mtp":
-                last_hidden_states = ret_hidden_states
-                hidden_states = ret_hidden_states
+                last_hidden_states = ret_hidden_states[0] if isinstance(ret_hidden_states, tuple) else ret_hidden_states
+                hidden_states = last_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
 
