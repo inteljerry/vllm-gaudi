@@ -116,6 +116,7 @@ class HpuEagleProposer(EagleProposer):
                 attn_metadata=attn_metadata,
             )
             if self.method == "mtp":
+                # Same DeepSeek-MTP tuple return as in propose() above.
                 last_hidden_states = ret_hidden_states[0] if isinstance(ret_hidden_states, tuple) else ret_hidden_states
                 hidden_states = last_hidden_states
             else:

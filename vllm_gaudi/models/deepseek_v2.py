@@ -126,10 +126,21 @@ def _hpu_restore_full_token_layout_if_needed(
     flattens hidden_states to [bs*seq, H] and residual stays [bs, seq, H].
     The guard fires spuriously on every prefill proposal (seq > 1) and the
     SP all-gather cat crashes on the 2D-vs-3D mismatch. HPU MoE kernels
-    handle expert parallelism internally (and use_sequence_parallel_moe
-    requires data_parallel_size > 1 anyway), so the all-gather is dead here;
-    just normalize both to token-major [bs*seq, H] for the residual add.
+    handle expert parallelism internally, so for the single-node EP setups this
+    plugin targets the all-gather is dead; just normalize both to token-major
+    [bs*seq, H] for the residual add.
+
+    ``is_sequence_parallel`` is NOT handled. It is unreachable at
+    data_parallel_size == 1 because ``_patch_use_sequence_parallel_moe`` restores
+    the DP>1 guard on ``use_sequence_parallel_moe`` -- but it IS reachable at DP>1,
+    and silently dropping the all-gather there would leave every rank holding only
+    its own shard, i.e. wrong output with no error. Raise instead.
     """
+    if is_sequence_parallel:
+        raise NotImplementedError(
+            "HPU MTP does not support sequence-parallel MoE: the upstream all-gather is skipped "
+            "by this patch, which would silently corrupt the residual add. Run with "
+            "data_parallel_size == 1 (where SP-MoE is disabled) or disable SP-MoE.")
     if hidden_states.dim() != residual.dim():
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         residual = residual.view(-1, residual.shape[-1])

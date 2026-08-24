@@ -18,9 +18,15 @@ def _fp32_rope_mode() -> str:
       'manual'                -> manual fp32 rotate_half (CPU bit-exact vs vLLM canonical; same
                                  fidelity and perf as fused, kept as a verifiable fallback);
       else / unset            -> off (fused bf16 kernel).
-    fp32 RoPE fixes byte-exact long-context copy (bf16 RoPE phase-noise cliffs ~196.6K). It costs
-    ~20% decode tok/s at SHORT ctx but only ~3% at 128K-256K (decode is KV-bound there), so it is
-    opt-in -- enable for long-context byte-exact-transcription workloads."""
+    fp32 RoPE fixes byte-exact long-context copy (bf16 RoPE phase-noise cliffs ~196.6K), so it is
+    opt-in: enable it for long-context byte-exact-transcription workloads.
+
+    Cost, as measured on the v0.24 stack: ~20% decode tok/s at short context, ~3% at 128K-256K
+    (decode is KV-bound there, so the extra RoPE work hides). Not re-measured on v0.26.
+
+    Read per call, deliberately: tests monkeypatch VLLM_FP32_ROPE at runtime
+    (tests/unit_tests/ops/test_hpu_rotary_fp32.py::test_mode_gate). Do not hoist to module scope
+    -- the lookup is a dict hit against a ~55 ms decode step, so it is not worth the coupling."""
     v = (os.environ.get('VLLM_FP32_ROPE') or '').lower()
     if v in ('1', 'true', 't', 'yes', 'y', 'on', 'fused'):
         return 'fused'
@@ -102,9 +108,9 @@ class HPURotaryEmbedding(RotaryEmbedding):
 
         # fp32 RoPE (VLLM_FP32_ROPE): rotate from a true-fp32 cos/sin cache to avoid the bf16
         # phase-noise floor at large positions; math matches the kernel path below.
-        num_tokens = positions.numel()
         fp32_mode = _fp32_rope_mode()
         if fp32_mode != 'off':
+            num_tokens = positions.numel()  # bf16 path below recomputes this; keep it branch-local
             cos, sin = self._fp32_cos_sin(positions, offsets)
             query_shape = query.shape
             key_shape = key.shape
@@ -112,7 +118,8 @@ class HPURotaryEmbedding(RotaryEmbedding):
             key = key.view(num_tokens, -1, self.head_size)
             if fp32_mode == 'fused':
                 # 'fused': feed fp32 cos/sin + fp32 q/k to the ONE fused Habana kernel instead of
-                # the ~14 unfused manual ops, recovering kernel speed if the kernel honors fp32.
+                # the ~14 unfused manual ops. The kernel does honor fp32 (verified byte-exact on
+                # hardware), so this keeps kernel speed at full precision.
                 rope_mode = (RotaryPosEmbeddingMode.BLOCKWISE
                              if self.is_neox_style else RotaryPosEmbeddingMode.PAIRWISE)
                 if self.head_size == self.rotary_dim:
