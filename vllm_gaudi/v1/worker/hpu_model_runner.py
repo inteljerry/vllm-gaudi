@@ -1455,9 +1455,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # Set up speculative decoding.
         # NOTE(Chendi): Speculative decoding is only enabled for the last rank
         # in the pipeline parallel group.
+        self.ngram_skip_empty_draft = False
         if self.speculative_config:
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
+                self.ngram_skip_empty_draft = get_config().ngram_skip_empty_draft
+                logger.info("ngram_skip_empty_draft=%s (VLLM_HPU_NGRAM_SKIP_EMPTY_DRAFT): "
+                            "an unmatched n-gram %s", self.ngram_skip_empty_draft,
+                            "proposes nothing and the request skips speculation this step"
+                            if self.ngram_skip_empty_draft else
+                            "proposes the sentinel [-1], which is always rejected")
             elif self.speculative_config.use_eagle():
                 from vllm_gaudi.v1.spec_decode.hpu_eagle import HpuEagleProposer
                 self.drafter = HpuEagleProposer(self.vllm_config, self.device, self)  # type: ignore
@@ -7287,10 +7294,22 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self.input_batch.num_tokens_no_spec,
             self.input_batch.token_ids_cpu,
         )
-        # swipe draft_token_ids_native replacing [] to [-1]
-        for i in range(len(draft_token_ids)):
-            if len(draft_token_ids[i]) == 0:
-                draft_token_ids[i] = [-1]
+        # NgramProposer.batch_propose returns [] for a request with no n-gram match.
+        #
+        # Default (skip disabled): rewrite [] to the sentinel [-1], which is upstream's
+        # PLACEHOLDER_TOKEN_ID. The scheduler then schedules one speculative token, so every
+        # decode step keeps the same speculative shape. That token can never equal the
+        # target's argmax, so the step pays a full verify only to reject it.
+        #
+        # Skip enabled: leave [] alone. The scheduler omits the request from
+        # scheduled_spec_decode_tokens, and _prepare_spec_decode_inputs already handles a
+        # request with zero draft tokens (num_sampled_tokens == 1, bonus logit only) -- the
+        # same path the padded dummy rows take today. When no request in the batch has a
+        # draft, that step runs as a plain decode and pays no verify at all.
+        if not self.ngram_skip_empty_draft:
+            for i in range(len(draft_token_ids)):
+                if len(draft_token_ids[i]) == 0:
+                    draft_token_ids[i] = [-1]
         return draft_token_ids
 
 

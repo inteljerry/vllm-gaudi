@@ -135,5 +135,16 @@ def get_features():
         # which FusedSDPA cannot index (it silently returns NaN). Off by default: only long
         # contexts with a wide context bucket can hit the limit.
         Value('enable_fsdpa_q_tiling', False, env_var='VLLM_HPU_FSDPA_Q_TILE_ENABLE', env_var_type=boolean),
+        # When the n-gram proposer finds no match it returns an empty draft. The runner has
+        # historically rewritten that to the sentinel [-1], which the scheduler then schedules as one
+        # speculative token. That token cannot match the target's argmax, so the step pays a full
+        # verify for a guaranteed rejection. Enabling this propagates the empty draft instead, so the
+        # scheduler skips speculation for that request.
+        # Off by default. The bucket set is unchanged -- both the plain and the speculative decode
+        # shapes are already generated -- but a plain decode step is never executed with n-gram on
+        # today, so under VLLM_SKIP_WARMUP that shape compiles lazily on first hit per context
+        # bucket. Warm the recipe cache before trusting an A/B against the sentinel behaviour.
+        Value('ngram_skip_empty_draft', False, env_var='VLLM_HPU_NGRAM_SKIP_EMPTY_DRAFT',
+              env_var_type=boolean),
     ]
     return split_values_and_flags(features)

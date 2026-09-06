@@ -183,6 +183,7 @@ full K/V and the results simply concatenate; the output is unchanged apart from 
 | Parameter name                    | Description                                                                | Default value |
 | --------------------------------- | -------------------------------------------------------------------------- | ------------- |
 | `VLLM_HPU_FSDPA_Q_TILE_ENABLE`    | Enable query tiling when the prompt attention bias would reach `2**31` bytes. | `false`     |
+| `VLLM_HPU_NGRAM_SKIP_EMPTY_DRAFT` | Skip speculation for a request whose n-gram proposer found no match, instead of proposing a placeholder token that is always rejected. | `false`     |
 
 !!! note
     This is independent of `VLLM_HPU_FSDPA_SLICE_ENABLED` and works with any bucketing strategy.
