@@ -930,10 +930,34 @@ _orig_default_moe_runner_forward = MoERunnerBase.forward
 _MOE_COMPILE = os.getenv("HPU_FUSED_MOE", "1") == "1"
 
 
+def _clear_stale_shared_experts_output(runner) -> None:
+    """Drop any shared-expert output left stashed by a forward that raised.
+
+    SharedExperts.forward stores its result in `_output[idx]` and the runner clears the slot when
+    it reads `.output`. A forward that raises between those two points leaves the slot populated,
+    and the NEXT forward trips `assert self._output[self._output_idx] is None`. That assertion then
+    becomes the only error anyone sees, which is actively misleading: on HPU the first failure can
+    be a device-side fault surfaced at a host sync inside the MoE call, and the assertion points at
+    the MoE state machine instead. Clearing the stash here does not fix such a fault, it just stops
+    it from being disguised as a different bug on the following step.
+    """
+    shared = getattr(runner, "_shared_experts", None)
+    slots = getattr(shared, "_output", None)
+    if isinstance(slots, list):
+        for i in range(len(slots)):
+            slots[i] = None
+
+
 def _patched_default_moe_runner_forward(self, *args, **kwargs):
-    if _MOE_COMPILE:
-        return patched_fused_moe_forward(self, *args, **kwargs)
-    return _orig_default_moe_runner_forward(self, *args, **kwargs)
+    try:
+        if _MOE_COMPILE:
+            return patched_fused_moe_forward(self, *args, **kwargs)
+        return _orig_default_moe_runner_forward(self, *args, **kwargs)
+    except BaseException:
+        # Nothing is swallowed: the original exception is re-raised unchanged. This only removes
+        # per-step state that would otherwise corrupt the next forward's error reporting.
+        _clear_stale_shared_experts_output(self)
+        raise
 
 
 MoERunnerBase.forward = _patched_default_moe_runner_forward
