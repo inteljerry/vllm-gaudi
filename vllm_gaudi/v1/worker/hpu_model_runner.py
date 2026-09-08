@@ -711,6 +711,29 @@ def ensure_multi_token_decodes_last(b: InputBatch, scheduled_tokens: Mapping[str
             write_pos += 1
 
 
+def grow_ngram_proposer_buffers(drafter: NgramProposer, num_requests: int) -> None:
+    """Widen the proposer's per-request scratch buffers to hold num_requests rows.
+
+    NgramProposer.__init__ allocates valid_ngram_draft and valid_ngram_num_drafts
+    with scheduler_config.max_num_seqs rows, but batch_propose indexes them by the
+    caller's request count. Warmup runs batches wider than max_num_seqs:
+    generate_spec_decode_buckets multiplies every decode bucket's batch size by
+    1 + num_speculative_tokens, and warmup_model then rebuilds input_batch to the
+    widest of those buckets. Row max_num_seqs onwards then walks off the end -- an
+    unchecked write inside the numba kernel, and an IndexError on the read after it.
+
+    This is a no-op while serving, where the batch never exceeds max_num_seqs. The
+    buffers carry no state between calls: every row batch_propose reads was written
+    by the same call's numba kernel, so a fresh zeroed buffer loses nothing.
+    """
+    num_drafts = drafter.valid_ngram_num_drafts
+    if num_requests <= num_drafts.shape[0]:
+        return
+    draft = drafter.valid_ngram_draft
+    drafter.valid_ngram_draft = np.zeros((num_requests, draft.shape[1]), dtype=draft.dtype)
+    drafter.valid_ngram_num_drafts = np.zeros((num_requests, ), dtype=num_drafts.dtype)
+
+
 def get_target_layer_suffix_list(model_type) -> list[str]:
     # This sets the suffix for the hidden layer name, which is controlled by
     # VLLM_CONFIG_HIDDEN_LAYERS. The default suffix is "DecoderLayer," which is
@@ -7284,6 +7307,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self,
         sampled_token_ids: list[list[int]],
     ) -> list[list[int]]:
+        # Warmup drives batches wider than max_num_seqs, which the proposer's
+        # pre-allocated buffers are not sized for. See grow_ngram_proposer_buffers.
+        grow_ngram_proposer_buffers(self.drafter, len(sampled_token_ids))
         # vLLM PR #32374 (Dynamic SD) added a leading num_speculative_tokens
         # positional arg to NgramProposer.propose(). Pass the statically
         # configured count to match the new signature.
