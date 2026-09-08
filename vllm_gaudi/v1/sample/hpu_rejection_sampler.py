@@ -4,6 +4,12 @@ from vllm.v1.sample import rejection_sampler
 import torch
 from typing import Optional
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, random_sample
+# The same threshold `Sampler.apply_temperature` uses to spot a greedy request.
+# It has to be a threshold rather than `== GREEDY_TEMPERATURE`: HPUInputBatch
+# stores -1.0 for greedy requests while `rejection_sampler.GREEDY_TEMPERATURE`
+# is 0, so an equality test would miss every greedy request on HPU.
+from vllm.v1.sample.sampler import _SAMPLING_EPS
 
 PLACEHOLDER_TOKEN_ID = rejection_sampler.PLACEHOLDER_TOKEN_ID
 GREEDY_TEMPERATURE = rejection_sampler.GREEDY_TEMPERATURE
@@ -124,6 +130,106 @@ def rejection_sample_pytorch(
     return output_tokens
 
 
+def expand_to_draft_rows(x: torch.Tensor, num_seqs: int, num_rows: int) -> torch.Tensor:
+    """Repeat a per-request tensor over that request's draft-token rows.
+
+    The HPU decode path lays the target logits out as `num_seqs` fixed-size
+    blocks of `max_spec_len` rows (see `_prepare_spec_decode_inputs`), padding
+    each block out to the batch-wide maximum instead of packing the rows by
+    actual draft count. So the expansion is a plain repeat, not upstream's
+    `cu_num_draft_tokens`-driven gather.
+    """
+    rows_per_seq, remainder = divmod(num_rows, num_seqs)
+    assert remainder == 0, (f"target logits rows ({num_rows}) are not a whole number of blocks "
+                            f"for {num_seqs} sequences; the HPU spec decode layout is expected "
+                            "to pad every request to the same number of draft rows")
+    return x.view(num_seqs, 1).expand(num_seqs, rows_per_seq).reshape(-1)
+
+
+def apply_sampling_constraints(
+    # [num_tokens, vocab_size]
+    logits: torch.Tensor,
+    # [batch_size]
+    cu_num_draft_tokens: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+) -> torch.Tensor:
+    """Scale the target logits by temperature and apply top-k/top-p.
+
+    Replaces the upstream helper of the same name, which expands the
+    per-request parameters with a Triton kernel (`expand_batch_to_tokens`).
+    Triton is disabled on HPU, so the expansion is done with plain torch ops
+    over the HPU block layout instead.
+    """
+    assert logits.ndim == 2
+    assert cu_num_draft_tokens.ndim == 1
+    if sampling_metadata.all_greedy:
+        # Same fast path as upstream: greedy requests read the raw argmax.
+        return logits
+
+    num_seqs = cu_num_draft_tokens.shape[0]
+    num_rows = logits.shape[0]
+
+    temperature = expand_to_draft_rows(sampling_metadata.temperature, num_seqs, num_rows)
+    # Greedy rows keep their logits untouched so their argmax stays exact.
+    temperature = torch.where(temperature < _SAMPLING_EPS, 1.0, temperature)
+    logits.div_(temperature.unsqueeze(-1))
+
+    top_k = None
+    if sampling_metadata.top_k is not None:
+        top_k = expand_to_draft_rows(sampling_metadata.top_k, num_seqs, num_rows)
+    top_p = None
+    if sampling_metadata.top_p is not None:
+        top_p = expand_to_draft_rows(sampling_metadata.top_p, num_seqs, num_rows)
+    # Masking the tail of the distribution never moves the argmax, so greedy
+    # rows are unaffected by top-k/top-p as well.
+    return apply_top_k_top_p(logits, top_k, top_p)
+
+
+def select_target_token_ids(
+    # [num_tokens, vocab_size]
+    target_logits: torch.Tensor,
+    # [batch_size]
+    num_draft_tokens: list[int],
+    sampling_metadata: SamplingMetadata,
+    use_fp64_gumbel: bool = False,
+) -> torch.Tensor:
+    """Pick the target model's token for every draft position.
+
+    Greedy requests take the argmax. The rest draw from the target distribution
+    that `apply_sampling_constraints` has already scaled, which keeps the
+    emitted tokens distributed exactly as the target model would sample them:
+    a draft token is accepted only when it equals that draw, and the draw
+    itself is what gets emitted on a mismatch.
+    """
+    if sampling_metadata.all_greedy:
+        return target_logits.argmax(dim=-1)
+
+    num_seqs = len(num_draft_tokens)
+    num_rows = target_logits.shape[0]
+    rows_per_seq = num_rows // num_seqs
+    # `random_sample` keys generators by row, so fan each seeded request's
+    # generator out over the rows of its block. Only over its *real* draft rows
+    # though: `random_sample` draws once per key, and the padding rows of a
+    # block are sized by the batch-wide maximum draft count, so covering them
+    # would let a co-scheduled request's draft count decide how much of a seeded
+    # request's generator gets consumed. Upstream guards the same way in
+    # `generate_uniform_probs` ("important for reproducibility").
+    row_generators = {
+        seq_idx * rows_per_seq + offset: generator
+        for seq_idx, generator in sampling_metadata.generators.items()
+        for offset in range(num_draft_tokens[seq_idx])
+    }
+    probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+    target_sampled = random_sample(probs, row_generators, use_fp64_gumbel)
+    if sampling_metadata.all_random:
+        return target_sampled
+
+    # `random_sample` scaled `probs` in place, so the argmax still has to come
+    # from `target_logits`.
+    is_greedy = expand_to_draft_rows(sampling_metadata.temperature, num_seqs, num_rows) < _SAMPLING_EPS
+    return torch.where(is_greedy, target_logits.argmax(dim=-1), target_sampled)
+
+
 def rejection_sample(
     # [num_tokens]
     draft_token_ids: torch.Tensor,
@@ -143,17 +249,15 @@ def rejection_sample(
     synthetic_conditional_rates: Optional[torch.Tensor] = None,
     use_fp64_gumbel: bool = False,
 ) -> torch.Tensor:
-    # NOTE: HPU spec decode only supports greedy sampling, so the
-    # `use_fp64_gumbel` knob (used by the random/gumbel recovery path upstream)
-    # is accepted for signature parity but intentionally unused here.
-    assert sampling_metadata.all_greedy, "Only greedy sampling is supported."
-
-    # Rejection sampling for greedy sampling requests.
-
-    target_argmax = target_probs.argmax(dim=-1)
-    output_token_ids = rejection_sample_pytorch(draft_token_ids, target_argmax, bonus_token_ids, num_draft_tokens,
+    # `target_probs` is the target logits after `apply_sampling_constraints`,
+    # matching the upstream signature.
+    target_token_ids = select_target_token_ids(target_probs, num_draft_tokens, sampling_metadata, use_fp64_gumbel)
+    output_token_ids = rejection_sample_pytorch(draft_token_ids, target_token_ids, bonus_token_ids, num_draft_tokens,
                                                 cu_num_draft_tokens)
     return output_token_ids
 
 
 rejection_sampler.rejection_sample = rejection_sample
+# `RejectionSampler.forward` looks both helpers up as module globals at call
+# time, so replacing them here covers the whole non-greedy path too.
+rejection_sampler.apply_sampling_constraints = apply_sampling_constraints

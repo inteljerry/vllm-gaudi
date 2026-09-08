@@ -4594,16 +4594,26 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 with self.profiler.record_event('internal', "sampler"):
                     ##### Sampling Start #####
                     spec_decode_metadata = decode_data.spec_decode_metadata
-                    sampler_output, sampling_metadata = self._run_sampling(
-                        batch_changed, logits_device
-                        if spec_decode_metadata is None else logits_device[spec_decode_metadata.bonus_logits_indices],
-                        pd_info.decode_req_ids, logits_device.shape[0])
-
                     if spec_decode_metadata is None:
+                        sampler_output, sampling_metadata = self._run_sampling(batch_changed, logits_device,
+                                                                               pd_info.decode_req_ids,
+                                                                               logits_device.shape[0])
                         decode_sampled_token_ids.append(sampler_output.sampled_token_ids.flatten())
                         logprobs_segments.append((list(pd_info.decode_req_ids), sampler_output.logprobs_tensors))
                     else:
                         # Handling spec decode sampling.
+                        # NOTE: spec decode flattens the decode batch to
+                        # [batch_size * num_tokens, 1], so logits_device holds one row per
+                        # sampled position, not per request. The bonus sampler inside
+                        # RejectionSampler.forward reads logits[bonus_logits_indices], which
+                        # is one row per request, so the sampling metadata has to be sized to
+                        # that instead. Padding it to logits_device.shape[0] leaves
+                        # temperature num_tokens times too long and kills the sampler on any
+                        # batch that is not all-greedy.
+                        htorch.core.mark_step()
+                        sampling_metadata = self._prepare_sampling(batch_changed, pd_info.decode_req_ids,
+                                                                   spec_decode_metadata.bonus_logits_indices.numel())
+                        htorch.core.mark_step()
                         sampler_output = self.rejection_sampler(
                             spec_decode_metadata,
                             None,  # draft_probs
