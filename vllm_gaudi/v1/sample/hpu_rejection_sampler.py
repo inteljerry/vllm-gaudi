@@ -85,7 +85,22 @@ def rejection_sample_pytorch(
     any_mismatch = mismatches.any(dim=1)
     # For sequence that the num draft tokens is 0, always consider all match
     any_mismatch[num_draft_tokens_per_seq == 0] = False
-    first_mismatch_idx = torch.argmax(mismatches.int(), dim=1)
+    if max_draft_tokens == 0:
+        # torch.argmax rejects a zero-width reduction dim, and max_draft_tokens is 0 exactly when
+        # EVERY sequence in the batch proposed no draft. That is reachable in production with
+        # VLLM_HPU_NGRAM_SKIP_EMPTY_DRAFT=true (an unmatched n-gram proposes nothing) once
+        # concurrency lets a whole batch miss on the same step -- at C=1 a lone miss is dropped
+        # from scheduled_spec_decode_tokens and never reaches this sampler, which is why it only
+        # shows up at C>=2.
+        #
+        # Zeros are EXACT here, not a papered-over value: first_mismatch_idx is consumed only as
+        # `(first_mismatch_idx + 1) * any_mismatch` below, and any_mismatch is all-False in this
+        # case (both from .any() over an empty dim and from the explicit zeroing above). So
+        # num_accepted collapses to num_draft_tokens_per_seq == 0 and each sequence emits its bonus
+        # token alone, which is the intended result when nothing was drafted.
+        first_mismatch_idx = torch.zeros(num_seqs, dtype=torch.int64, device=device)
+    else:
+        first_mismatch_idx = torch.argmax(mismatches.int(), dim=1)
 
     # 4. Determine the number of accepted tokens for each sequence
     # If a mismatch occurs, we accept tokens up to and including the mismatch.
