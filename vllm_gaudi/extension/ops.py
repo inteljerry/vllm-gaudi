@@ -636,6 +636,49 @@ class MoeMatmul(torch.nn.Module):
         raise NotImplementedError()
 
 
+_MOE_OVERLOAD_FALLBACK_WARNED: set = set()
+
+
+def _moe_overload(name: str):
+    """Bind one `hpu::mixture_of_experts` overload by name instead of going through the packet.
+
+    The operator carries 21 overloads. Calling the packet makes pybind try them in registration
+    order, and one of the rejected candidates (`fp8_fused_weights_scalars`) declares
+    `d_scale_hidden_states` as a float while the dynamic-scale path below passes a tensor. Building
+    that one mismatch message calls `py::repr` on the tensor, and a tensor repr is evaluated on the
+    device on HPU, so every call pays host round trips that produce nothing. It is also where a
+    device-side fault surfaces, which is how one was mistaken for a MoE state-machine bug.
+    Binding the overload does NOT fix that fault: with this in place the same
+    `ValidateSyncInputTensors` failure reappears at the sampler instead, so the repr was where the
+    fault surfaced rather than its cause. This is a performance change only.
+
+    Numerics are unchanged: this is the overload the packet already selects. Falls back to the
+    packet if a Habana build does not expose the name, so an older runtime keeps working. The
+    fallback is announced once per name: it silently restores the per-call host sync this function
+    exists to remove, and a silent restoration looks exactly like the patch working.
+
+    No result cache here on purpose. `OpOverloadPacket.__getattr__` already ends in
+    `setattr(self, key, overload)`, so torch caches the lookup itself and a second dict buys
+    nothing. It also costs something: caching the PACKET under the overload's name means one
+    transient miss is remembered forever, so a build that registers the op late would keep taking
+    the slow path for the life of the process.
+
+    A fallback here does NOT cover schema drift. If the name resolves but its signature has moved,
+    the lookup succeeds and the CALL raises instead -- that surfaces as a normal error rather than
+    silently degrading, which is the intended behaviour.
+    """
+    try:
+        return getattr(torch.ops.hpu.mixture_of_experts, name)
+    except AttributeError:
+        if name not in _MOE_OVERLOAD_FALLBACK_WARNED:
+            _MOE_OVERLOAD_FALLBACK_WARNED.add(name)
+            logger.warning(
+                "hpu::mixture_of_experts has no overload %r on this Habana build; falling back to "
+                "the operator packet. Correct, but every MoE forward pays the overload-resolution "
+                "host sync this binding removes.", name)
+        return torch.ops.hpu.mixture_of_experts
+
+
 class VllmMixtureOfExpertsOpBase(torch.nn.Module):
 
     def __init__(self,
@@ -1386,38 +1429,46 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
 
         if self.w13_input_scale is None:
             x_fp8, x_scale = dynamic_quant(x)
-            final_hidden_states = torch.ops.hpu.mixture_of_experts(hidden_states=x_fp8,
-                                                                   expert_routing_table=topk_ids.to(torch.int64),
-                                                                   router_weights=topk_weights.to(x.dtype),
-                                                                   w12=w13_list,
-                                                                   w3=w2_list,
-                                                                   d_scale_hidden_states=x_scale,
-                                                                   d_scale_w12=w13_weight_scale,
-                                                                   d_scale_w3=w2_weight_scale,
-                                                                   permuted_weights=permuted_weights,
-                                                                   activation=activation,
-                                                                   experts_min=self.experts_min,
-                                                                   experts_max=self.experts_max,
-                                                                   **kwargs)
+            moe_dyn = _moe_overload("fp8_fused_weights_dynamic")
+            final_hidden_states = moe_dyn(hidden_states=x_fp8,
+                                          expert_routing_table=topk_ids.to(torch.int64),
+                                          router_weights=topk_weights.to(x.dtype),
+                                          w12=w13_list,
+                                          w3=w2_list,
+                                          d_scale_hidden_states=x_scale,
+                                          d_scale_w12=w13_weight_scale,
+                                          d_scale_w3=w2_weight_scale,
+                                          permuted_weights=permuted_weights,
+                                          activation=activation,
+                                          experts_min=self.experts_min,
+                                          experts_max=self.experts_max,
+                                          **kwargs)
         else:
             x_scale = self.w13_input_scale.data
             # w2_input_scale should be List[Tensor] when static and fused
             w2_input_scale = [self.w2_input_scale[i] for i in range(self.num_experts)]
             x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0 / x_scale, False, False, torch.float8_e4m3fn)[0]
+            # NOT bound to a named overload, unlike the dynamic branch above. This path resolves
+            # to `fp8_fused_weights` after five rejected candidates, but every one of those is
+            # rejected at a missing argument or at the kwarg-count check, and neither formats a
+            # value -- so no `py::repr` runs and there is no host sync to remove
+            # [src: .out/glm-53/c1-ladder-20260904/results/PERF-moe-overload-resolution.md, the
+            # sibling-call-sites table]. The deployed config takes the dynamic branch, so binding
+            # this one would change an unexercised path for no measured gain.
             final_hidden_states = torch.ops.hpu.mixture_of_experts(hidden_states=x_fp8,
-                                                                   expert_routing_table=topk_ids.to(torch.int64),
-                                                                   router_weights=topk_weights.to(x.dtype),
-                                                                   w12=w13_list,
-                                                                   w3=w2_list,
-                                                                   d_scale_hidden_states=x_scale,
-                                                                   d_scale_intermediate_hidden_states=w2_input_scale,
-                                                                   d_scale_w12=w13_weight_scale,
-                                                                   d_scale_w3=w2_weight_scale,
-                                                                   permuted_weights=permuted_weights,
-                                                                   activation=activation,
-                                                                   experts_min=self.experts_min,
-                                                                   experts_max=self.experts_max,
-                                                                   **kwargs)
+                                             expert_routing_table=topk_ids.to(torch.int64),
+                                             router_weights=topk_weights.to(x.dtype),
+                                             w12=w13_list,
+                                             w3=w2_list,
+                                             d_scale_hidden_states=x_scale,
+                                             d_scale_intermediate_hidden_states=w2_input_scale,
+                                             d_scale_w12=w13_weight_scale,
+                                             d_scale_w3=w2_weight_scale,
+                                             permuted_weights=permuted_weights,
+                                             activation=activation,
+                                             experts_min=self.experts_min,
+                                             experts_max=self.experts_max,
+                                             **kwargs)
 
         return final_hidden_states
 
