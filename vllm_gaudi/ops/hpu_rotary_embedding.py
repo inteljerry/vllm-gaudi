@@ -13,25 +13,52 @@ from vllm.model_executor.custom_op import CustomOp
 
 def _fp32_rope_mode() -> str:
     """VLLM_FP32_ROPE (base HPURotaryEmbedding only; scaled-rope subclasses ignore it):
+      unset / ''              -> 'fused' (THE DEFAULT, see below);
       '1'/'true'/'on'/'fused' -> 'fused': fp32 cos/sin fed to the fused Habana apply_rotary_pos_emb
                                  (one kernel; the kernel honors fp32 -- hardware-verified byte-exact);
       'manual'                -> manual fp32 rotate_half (CPU bit-exact vs vLLM canonical; same
                                  fidelity and perf as fused, kept as a verifiable fallback);
-      else / unset            -> off (fused bf16 kernel).
-    fp32 RoPE fixes byte-exact long-context copy (bf16 RoPE phase-noise cliffs ~196.6K), so it is
-    opt-in: enable it for long-context byte-exact-transcription workloads.
+      '0'/'false'/'off'       -> off (fused bf16 kernel), and so does any unrecognized value.
+
+    fp32 RoPE DEFAULTS ON because bf16 RoPE does not merely lose byte-exactness at long context --
+    it returns unusable answers. Measured on GLM-5.3-FP8 (glm_moe_dsa, 8x Gaudi3, TP8, this branch)
+    at 220,907 real prompt tokens over /v1/chat/completions at temperature 0.7, three values planted
+    at depths 0.2/0.5/0.8 of the prompt and all three asked for in one request:
+
+      bf16 RoPE  0/10 usable  (0/5 with n-gram speculation on, 0/5 with it off)
+      fp32 RoPE  4/5 clean, 5/5 with every value correct
+      Fisher exact, one-sided, p = 0.0037
+
+    Re-verified through the deployment recipe with no env override: 7/8 clean at 220,907 (8/8 values
+    correct) and 4/4 at 240,107. bf16 loses the TAIL of multi-token numbers -- planted 302737 /
+    387881 / 268879 came back as "302" / "388" / "268" -- or the model spends its whole token budget
+    re-verifying and returns empty content. Below ~192K both settings are clean (15/15 at 64K, 5/5 at
+    184K), so this only bites long-context traffic.
+
+    Speculative decoding, HPU bucket padding, bf16 block softmax and the FusedSDPA 2**31 bias-plane
+    guard were each A/B'd and are NOT implicated. VLLM_FP32_SOFTMAX=1 crashes the engine at 230K and
+    is not a substitute.
 
     Cost, as measured on the v0.24 stack: ~20% decode tok/s at short context, ~3% at 128K-256K
-    (decode is KV-bound there, so the extra RoPE work hides). Not re-measured on v0.26.
+    (decode is KV-bound there, so the extra RoPE work hides). Not re-measured on v0.26. Every
+    published throughput figure for this branch was already measured with fp32 RoPE on, so making it
+    the default does not move those numbers. Set VLLM_FP32_ROPE=0 to opt out -- worth it only for a
+    short-context workload that needs the decode headroom and never approaches 200K.
 
     Read per call, deliberately: tests monkeypatch VLLM_FP32_ROPE at runtime
     (tests/unit_tests/ops/test_hpu_rotary_fp32.py::test_mode_gate). Do not hoist to module scope
     -- the lookup is a dict hit against a ~55 ms decode step, so it is not worth the coupling."""
-    v = (os.environ.get('VLLM_FP32_ROPE') or '').lower()
+    raw = os.environ.get('VLLM_FP32_ROPE')
+    v = (raw or '').lower()
     if v in ('1', 'true', 't', 'yes', 'y', 'on', 'fused'):
         return 'fused'
     if v == 'manual':
         return 'manual'
+    if raw is None or v == '':
+        # Unset, or set-but-empty (which is how an unset shell/docker variable arrives).
+        return 'fused'
+    # Explicit '0'/'off'/'false', and anything unrecognized, stay off: an unrecognized value used to
+    # mean off, and silently turning the extra cost ON for a typo would be the worse surprise.
     return 'off'
 
 

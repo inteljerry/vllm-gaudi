@@ -66,8 +66,14 @@ def test_mode_gate(monkeypatch):
         assert _fp32_rope_mode() == "fused"
     monkeypatch.setenv("VLLM_FP32_ROPE", "manual")
     assert _fp32_rope_mode() == "manual"
-    for v in ("0", "off", "", "prefill"):  # 'prefill' was removed -> off
+    for v in ("0", "off", "false", "prefill"):  # 'prefill' was removed; unrecognized -> off
         monkeypatch.setenv("VLLM_FP32_ROPE", v)
         assert _fp32_rope_mode() == "off"
+    # DEFAULT IS 'fused'. bf16 RoPE returns unusable answers above ~200K on GLM-5.3: 0/10 clean at
+    # 220,907 prompt tokens against 4/5 for fp32 (Fisher exact one-sided p = 0.0037), and the failure
+    # survives turning n-gram speculation off. See _fp32_rope_mode's docstring for the full A/B.
     monkeypatch.delenv("VLLM_FP32_ROPE", raising=False)
-    assert _fp32_rope_mode() == "off"
+    assert _fp32_rope_mode() == "fused"
+    # set-but-empty is how an unset shell/docker variable arrives; it must read as unset, not as off
+    monkeypatch.setenv("VLLM_FP32_ROPE", "")
+    assert _fp32_rope_mode() == "fused"
