@@ -711,6 +711,68 @@ def ensure_multi_token_decodes_last(b: InputBatch, scheduled_tokens: Mapping[str
             write_pos += 1
 
 
+def prefill_logits_position(seq_num_computed_tokens: int, seq_num_scheduled_tokens: int, num_tokens_no_spec: int,
+                            always_sample: bool) -> Optional[int]:
+    """Position, within the scheduled chunk, of the one logit a prefill step may sample.
+
+    A prefill step commits at most one token per request - the path has no rejection
+    sampler, so any further logit is committed unverified - and that token must come
+    from the last token of the chunk that is NOT an unverified speculative draft.
+    num_tokens_no_spec is exactly that boundary (drafts are written to token_ids_cpu
+    starting at it), so the position is num_tokens_no_spec - 1 - computed. The
+    previous `min(computed + scheduled - num_prompt_tokens + 1, scheduled)` count
+    returned O+1 for a request resumed from preemption with a partial prefix-cache
+    hit, whose num_prompt_tokens is short by its O emitted tokens: add_request only
+    inflates it when num_computed_tokens == 0, and a cache hit makes that non-zero.
+    That value is still short - keying on num_tokens_no_spec, which add_request sets
+    unconditionally from request.num_tokens, is what makes it stop mattering here.
+
+    On an ordinary chunk this is the last scheduled token, matching upstream's
+    `logits_indices = query_start_loc[1:] - 1`. It is NOT the last scheduled token
+    when the scheduler pads a request whose remaining work is a single token up to
+    1 + num_spec_tokens and attaches [-1] drafts: the sequence completes at position
+    0 and the rest of the chunk holds sentinels, or stale token_ids_cpu contents for
+    a request added this step.
+
+    None when the chunk ends before the sequence does, except under async scheduling
+    or structured output (always_sample), which need a logit either way and discard
+    it via invalid_req_indices.
+    """
+    if seq_num_scheduled_tokens <= 0:
+        # Nothing to sample from, and the positions below would be negative indices.
+        # Defensive: the only scheduler branch that sets num_new_tokens = 0
+        # (load_kv_async) continues before writing num_scheduled_tokens.
+        return None
+    last = seq_num_scheduled_tokens - 1
+    if seq_num_computed_tokens + seq_num_scheduled_tokens < num_tokens_no_spec and not always_sample:
+        return None
+    completion = num_tokens_no_spec - 1 - seq_num_computed_tokens
+    if completion < 0:
+        # computed has caught up with the real token count: the request is past its
+        # prefill - async scheduling leaves num_tokens_no_spec stale once decoding
+        # starts, because the post-sampling writer never runs there - or its
+        # bookkeeping is inconsistent. Sample the last scheduled position, which is
+        # what this path did before. Clamping to 0 instead would pick a wrong token
+        # rather than a merely unexpected one.
+        return last
+    # completion exceeds last only on a partial chunk under always_sample, where the
+    # logit is discarded anyway.
+    return min(last, completion)
+
+
+def assert_sampled_token_budget(req_id: str, num_sampled: int, max_sampled_per_request: int) -> None:
+    """Fail at the accumulation site if one step collected too many tokens for a request.
+
+    A step commits at most one sampled token per request plus the drafts it verified.
+    Exceeding that means the same request id was named once per prefill logit (see
+    prefill_logits_position), and committing the extras corrupts request state while
+    only surfacing one step later in the spec-decode metrics counter.
+    """
+    assert num_sampled <= max_sampled_per_request, (
+        f"Request {req_id} accumulated {num_sampled} sampled tokens in a single step, "
+        f"but at most {max_sampled_per_request} can be committed.")
+
+
 def grow_ngram_proposer_buffers(drafter: NgramProposer, num_requests: int) -> None:
     """Widen the proposer's per-request scratch buffers to hold num_requests rows.
 
@@ -1483,11 +1545,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
                 self.ngram_skip_empty_draft = get_config().ngram_skip_empty_draft
-                logger.info("ngram_skip_empty_draft=%s (VLLM_HPU_NGRAM_SKIP_EMPTY_DRAFT): "
-                            "an unmatched n-gram %s", self.ngram_skip_empty_draft,
-                            "proposes nothing and the request skips speculation this step"
-                            if self.ngram_skip_empty_draft else
-                            "proposes the sentinel [-1], which is always rejected")
+                logger.info(
+                    "ngram_skip_empty_draft=%s (VLLM_HPU_NGRAM_SKIP_EMPTY_DRAFT): "
+                    "an unmatched n-gram %s", self.ngram_skip_empty_draft,
+                    "proposes nothing and the request skips speculation this step"
+                    if self.ngram_skip_empty_draft else "proposes the sentinel [-1], which is always rejected")
             elif self.speculative_config.use_eagle():
                 from vllm_gaudi.v1.spec_decode.hpu_eagle import HpuEagleProposer
                 self.drafter = HpuEagleProposer(self.vllm_config, self.device, self)  # type: ignore
@@ -2705,23 +2767,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # self.input_batch.num_prompt_tokens[batch_idx] == self.input_batch.num_tokens[batch_idx].
             # In preemption scenario num_tokens will also include the tokens emitted before preemption
             num_prompt_tokens = self.input_batch.num_prompt_tokens[batch_idx]
-            if self.use_async_scheduling or self.use_structured_output:
-                # NOTE(tianmu-li): align behavior of incomplete prompt with gpu_model_runner
-                # Always have at least 1 logit when using async scheduling
-                # or structured output
-                if seq_num_computed_tokens + seq_num_scheduled_tokens - num_prompt_tokens + 1 < 1:
-                    num_output_logits = 1
-                    if self.use_async_scheduling:
-                        # Discard partial prefill logit for async scheduling
-                        self.invalid_req_indices.append(batch_idx)
-                else:
-                    num_output_logits = seq_num_computed_tokens + seq_num_scheduled_tokens - num_prompt_tokens + 1
-            else:
-                num_output_logits = max(0, seq_num_computed_tokens + seq_num_scheduled_tokens - num_prompt_tokens + 1)
-            # Cap to scheduled tokens (needed when decode recomputation
-            # requests are routed through the prefill path).
-            num_output_logits = min(num_output_logits, seq_num_scheduled_tokens)
-            logits_positions = list(range(seq_num_scheduled_tokens - num_output_logits, seq_num_scheduled_tokens))
+            # NOTE(tianmu-li): align behavior of incomplete prompt with gpu_model_runner
+            # Always have at least 1 logit when using async scheduling
+            # or structured output
+            always_sample = self.use_async_scheduling or self.use_structured_output
+            logits_position = prefill_logits_position(seq_num_computed_tokens, seq_num_scheduled_tokens,
+                                                      int(self.input_batch.num_tokens_no_spec[batch_idx]),
+                                                      always_sample)
+            if self.use_async_scheduling and seq_num_computed_tokens + seq_num_scheduled_tokens < num_prompt_tokens:
+                # Discard partial prefill logit for async scheduling
+                self.invalid_req_indices.append(batch_idx)
+            logits_positions = [] if logits_position is None else [logits_position]
 
             new_batch_contents = BatchContents(
                 req_ids=[req_id],
@@ -3098,8 +3154,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         token_ids = list(int(i) for i in range(query_len))
         num_blocks = round_up(context_len + query_len, self.attn_block_size) // self.attn_block_size
         blocks = [0] * num_blocks
-        num_output_logits = context_len + query_len - prompt_tokens + 1
-        logits_positions = list(range(query_len - num_output_logits, query_len))
+        # Synthetic requests: no output tokens and no drafts, so prompt_tokens is the
+        # whole sequence length and serves as num_tokens_no_spec.
+        logits_position = prefill_logits_position(context_len, query_len, prompt_tokens, always_sample=False)
+        logits_positions = [] if logits_position is None else [logits_position]
 
         new_batch_contents = BatchContents(
             req_ids=[req_id],
@@ -4737,12 +4795,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 # NOTE(Chendi): in post-processing, spec_decode might
                 # return more than 1 token during decode.
                 start_idx = 0
+                max_sampled_per_request = 1 + (self.speculative_config.num_speculative_tokens
+                                               if self.speculative_config else 0)
                 for i, req_id in enumerate(sampled_token_requests):
                     num_tokens = spec_decode_num_tokens[
                         i] if spec_decode_num_tokens is not None and i < num_decodes else 1
-                    postprocessed_sampled_token_ids[
-                        self.input_batch.req_id_to_index[req_id]] += sampled_token_ids_list[start_idx:start_idx +
-                                                                                            num_tokens]
+                    req_sampled = postprocessed_sampled_token_ids[self.input_batch.req_id_to_index[req_id]]
+                    req_sampled += sampled_token_ids_list[start_idx:start_idx + num_tokens]
+                    assert_sampled_token_budget(req_id, len(req_sampled), max_sampled_per_request)
                     start_idx += num_tokens
 
         ################## RETURN ##################
